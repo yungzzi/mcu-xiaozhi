@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}聊天 · MCU 小智{% endblock %}
+{% block topbar_right %}
+<nav class="topnav">
+  <a href="{{ url_for('history_page') }}">历史</a>
+  <a href="{{ url_for('home_page') }}">账号</a>
+  <form method="post" action="{{ url_for('logout') }}">
+    <button class="linklike" type="submit">退出</button>
+  </form>
+</nav>
+{% endblock %}
+{% block content %}
+<div class="chat-wrap">
+  <div class="conv-bar">
+    <select id="conv-select" aria-label="选择聊天"></select>
+    <button id="new-conv" type="button">新聊天</button>
+  </div>
+  <div id="messages" class="messages"></div>
+  <div id="banner" class="banner" hidden>
+    <span id="banner-text"></span>
+    <button id="resend" type="button">重发上一条</button>
+  </div>
+  <form id="composer" class="composer">
+    <textarea id="input" rows="2" placeholder="输入问题…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="send" type="submit">发送</button>
+  </form>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', path='chat.js') }}"></script>
+{% endblock %}

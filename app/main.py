@@ -9,7 +9,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .auth import COOKIE_NAME, AuthService
+from .chat import register_chat_routes
 from .config import Settings
+from .coze import get_client
 from .db import Database
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -31,8 +33,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db = db
     app.state.auth = auth
     app.state.templates = templates
+    app.state.coze = get_client(settings)
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+    register_chat_routes(app)
 
     def current_session(request: Request):
         return auth.get_session(request.cookies.get(COOKIE_NAME))
@@ -52,13 +56,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/", include_in_schema=False)
     def index(request: Request):
         if current_session(request):
-            return RedirectResponse(app.url_path_for("home_page"), status_code=303)
+            return RedirectResponse(app.url_path_for("chat_page"), status_code=303)
         return login_redirect()
 
     @app.get("/login", name="login_page")
     def login_page(request: Request, msg: str = ""):
         if current_session(request):
-            return RedirectResponse(app.url_path_for("home_page"), status_code=303)
+            return RedirectResponse(app.url_path_for("chat_page"), status_code=303)
         return templates.TemplateResponse(request, "login.html", {"msg": msg})
 
     @app.post("/login")
@@ -73,7 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request, "login.html", {"msg": "账号或密码不正确"}, status_code=401
             )
         token, max_age = auth.create_session(username, remember == "on")
-        resp = RedirectResponse(app.url_path_for("home_page"), status_code=303)
+        resp = RedirectResponse(app.url_path_for("chat_page"), status_code=303)
         resp.set_cookie(
             COOKIE_NAME,
             token,
