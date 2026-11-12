@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行时数据（SQLite、上传文件）
+data/
+uploads/
+*.sqlite3
+*.db
+
+# 凭证与本地配置：绝不入库
+secrets/
+.env
+*.token
+*.pat
+
+# 本地模拟/联调产物
+.local/
+run.log
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
