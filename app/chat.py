@@ -53,11 +53,13 @@ class _GuardedStreamingResponse(StreamingResponse):
         finally:
             # 显式关闭可能暂停在 yield 的生成器：触发中断记录与上游清理，
             # 收尾完成后再释放锁（审阅三轮 P2）。
+            # 内层 finally：aclose 即使抛出取消异常也必须解锁（审阅四轮）。
             try:
                 await self.body_iterator.aclose()
             except Exception:
                 logging.getLogger("mcu.chat").exception("stream aclose failed")
-            self._guard.release()
+            finally:
+                self._guard.release()
 
 
 def register_chat_routes(app):
@@ -194,17 +196,17 @@ def register_chat_routes(app):
         await lock.acquire()
         guard = _LockGuard(lock)
 
-        # 取锁后、首次写入前重新校验会话（审阅三轮 P1）：
-        # 等待请求体期间旧聊天可能已被删除、整数 ID 被新聊天复用；
-        # 必须确认存在、归属一致、且仍是原会话（created_at 身份）才能写入。
-        conv_now = owned_conv(session, cid)
-        if conv_now is None or conv_now["created_at"] != conv["created_at"]:
-            guard.release()
-            return JSONResponse({"error": "not_found"}, status_code=404)
-        conv = conv_now
-
-        # 取锁后到流开始前的所有步骤都在释放保护内
+        # 取锁后到流开始前的所有步骤（含会话重查）都在释放保护内（审阅四轮 P1）
         try:
+            # 取锁后、首次写入前重新校验会话（审阅三轮 P1）：
+            # 等待请求体期间旧聊天可能已被删除、整数 ID 被新聊天复用；
+            # 必须确认存在、归属一致、且仍是原会话（created_at 身份）才能写入。
+            conv_now = owned_conv(session, cid)
+            if conv_now is None or conv_now["created_at"] != conv["created_at"]:
+                guard.release()
+                return JSONResponse({"error": "not_found"}, status_code=404)
+            conv = conv_now
+
             file_ids = []
             att_rows = []
             for aid in attachment_ids:
@@ -310,8 +312,11 @@ def register_chat_routes(app):
             finally:
                 # 先收尾再释放锁（审阅三轮 P2）：显式关闭上游扣子流，
                 # 完成连接清理；中断记录已在 except 分支落库。
-                await stream.aclose()
-                guard.release()
+                # 内层 finally：aclose 抛出取消异常时也保证解锁（审阅四轮）。
+                try:
+                    await stream.aclose()
+                finally:
+                    guard.release()
 
         return _GuardedStreamingResponse(
             gen(),

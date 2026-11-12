@@ -10,12 +10,14 @@
 """
 import asyncio
 import json
+import sqlite3
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app.auth import COOKIE_NAME
+from app.chat import _GuardedStreamingResponse, _LockGuard
 from app.db import now
 from conftest import PASSWORD, login
 from test_chat import parse_sse
@@ -318,3 +320,82 @@ def test_conv_deleted_during_body_read(app, env):
     statuses = _drive_with_body_mutation(app, cookie, cid, mutate)
     assert statuses == [404]
     assert not app.state.chat_locks[cid].locked()
+
+
+def test_recheck_query_failure_releases_lock(app, env):
+    """审阅四轮 P1 回归：锁内会话重查瞬时失败 → 500，但锁必须释放，恢复后可重发。"""
+    c, cookie, cid = env
+    db = app.state.db
+    original = db.query_one
+    calls = {"n": 0}
+
+    def flaky(sql, params=()):
+        if sql.startswith("SELECT * FROM conversations"):
+            calls["n"] += 1
+            if calls["n"] == 2:  # 第 1 次=取锁前初查，第 2 次=锁内重查
+                raise sqlite3.OperationalError("simulated transient db failure")
+        return original(sql, params)
+
+    db.query_one = flaky
+    try:
+        with TestClient(app, raise_server_exceptions=False) as c2:
+            c2.cookies.set(COOKIE_NAME, cookie)
+            r = c2.post(f"/api/conversations/{cid}/send", json={"text": "重查失败"})
+            assert r.status_code == 500
+    finally:
+        db.query_one = original
+    assert calls["n"] >= 2, "前置条件：锁内重查确实被执行并失败"
+    assert not app.state.chat_locks[cid].locked(), "重查异常后锁必须释放"
+    r = c.post(f"/api/conversations/{cid}/send", json={"text": "恢复后的正常重发"})
+    assert r.status_code == 200
+    assert parse_sse(r.text)[-1][0] == "done"
+
+
+def test_aclose_cancelled_still_releases_lock(app):
+    """审阅四轮：响应收尾 aclose 抛取消异常时，内层 finally 仍须解锁。"""
+    async def run():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        guard = _LockGuard(lock)
+
+        async def g():
+            yield "data: x\n\n"
+
+        class CancelOnClose:
+            """代理异步迭代器：aclose 时抛取消异常（async_generator.aclose 只读，无法直接 patch）。"""
+
+            def __init__(self, agen):
+                self._agen = agen
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await self._agen.__anext__()
+
+            async def aclose(self):
+                raise asyncio.CancelledError()
+
+        resp = _GuardedStreamingResponse(CancelOnClose(g()), guard, media_type="text/event-stream")
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": "/", "raw_path": b"/",
+            "query_string": b"", "root_path": "", "headers": [],
+            "client": ("127.0.0.1", 1), "server": ("test", 80),
+        }
+        hold = asyncio.Event()
+
+        async def receive():
+            await hold.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            pass
+
+        try:
+            await resp(scope, receive, send)
+        except asyncio.CancelledError:
+            pass
+        assert not lock.locked(), "aclose 取消异常后锁必须释放"
+
+    asyncio.run(run())
