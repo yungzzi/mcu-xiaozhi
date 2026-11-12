@@ -22,12 +22,42 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+class _LockGuard:
+    """幂等释放 holders：endpoint 建立阶段、生成器、响应生命周期共用同一个 guard。
+
+    审阅二轮 P1：客户端在首包前（响应头阶段）断连时生成器尚未启动，
+    仅靠生成器 finally 无法释放锁；响应 __call__ 的 finally 兜底释放。
+    """
+
+    def __init__(self, lock: asyncio.Lock):
+        self._lock = lock
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._lock.release()
+
+
+class _GuardedStreamingResponse(StreamingResponse):
+    """锁释放覆盖整个响应生命周期（含响应头发送失败/生成器未启动即断连）。"""
+
+    def __init__(self, content, guard: _LockGuard, **kwargs):
+        super().__init__(content, **kwargs)
+        self._guard = guard
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._guard.release()
+
+
 def register_chat_routes(app):
     db = app.state.db
     auth = app.state.auth
     settings = app.state.settings
     templates = app.state.templates
-    client = app.state.coze
     locks: dict[int, asyncio.Lock] = {}
     app.state.chat_locks = locks
 
@@ -103,15 +133,25 @@ def register_chat_routes(app):
         return {"messages": msgs}
 
     @app.delete("/api/conversations/{cid}")
-    def delete_conversation(request: Request, cid: int):
+    async def delete_conversation(request: Request, cid: int):
         session = session_of(request)
         if session is None:
             return unauthorized()
         if owned_conv(session, cid) is None:
             return JSONResponse({"error": "not_found"}, status_code=404)
-        db.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)", (cid,))
-        db.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
-        db.execute("DELETE FROM conversations WHERE id=?", (cid,))
+        # 与发送共用同一会话锁：生成中禁止删除（审阅二轮 P1）
+        lock = locks.setdefault(cid, asyncio.Lock())
+        if lock.locked():
+            return JSONResponse(
+                {"error": "busy", "message": "当前聊天正在生成回复，请稍候再删除"}, status_code=409
+            )
+        await lock.acquire()
+        try:
+            db.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)", (cid,))
+            db.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
+            db.execute("DELETE FROM conversations WHERE id=? AND token_hash=?", (cid, session["token_hash"]))
+        finally:
+            lock.release()
         return {"ok": True}
 
     @app.post("/api/conversations/{cid}/send")
@@ -145,6 +185,7 @@ def register_chat_routes(app):
         if lock.locked():
             return JSONResponse({"error": "busy", "message": "当前聊天正在生成回复，请稍候"}, status_code=409)
         await lock.acquire()
+        guard = _LockGuard(lock)
 
         # 取锁后到流开始前的所有步骤都在释放保护内
         try:
@@ -155,7 +196,7 @@ def register_chat_routes(app):
                     "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
                 )
                 if att is None:
-                    lock.release()
+                    guard.release()
                     return JSONResponse({"error": "attachment_not_found"}, status_code=404)
                 att_rows.append(att)
                 if att["coze_file_id"]:
@@ -172,28 +213,42 @@ def register_chat_routes(app):
                 db.execute("UPDATE conversations SET title=? WHERE id=?", (text[:30], cid))
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
         except Exception:
-            lock.release()
+            guard.release()
             raise
 
         coze_conv_id = conv["coze_conversation_id"]
         token_hash = session["token_hash"]
         coze_user_id = session["coze_user_id"]
+        conv_created = conv["created_at"]
+
+        def conv_alive() -> bool:
+            # 写入时校验：会话仍存在、归属一致、且是本轮开始时的同一会话
+            # （created_at 防止 SQLite 复用已删除整数 ID 后误写新会话，审阅二轮 P1）
+            return db.query_one(
+                "SELECT id FROM conversations WHERE id=? AND token_hash=? AND created_at=?",
+                (cid, token_hash, conv_created),
+            ) is not None
 
         def save_assistant(content: str, status: str) -> int:
+            if not conv_alive():
+                return -1
             cur = db.execute(
                 "INSERT INTO messages(conversation_id, role, content, status, created_at) VALUES(?,?,?,?,?)",
                 (cid, "assistant", content, status, now()),
             )
-            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
+            db.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=? AND token_hash=? AND created_at=?",
+                (now(), cid, token_hash, conv_created),
+            )
             return cur.lastrowid
 
         async def gen():
             acc: list[str] = []
             content = None
-            err = None
+            saved = False
             nonlocal coze_conv_id
             try:
-                async for ev in client.stream_chat(
+                async for ev in app.state.coze.stream_chat(
                     ChatRequest(
                         user_id=coze_user_id,
                         conversation_id=coze_conv_id,
@@ -205,8 +260,8 @@ def register_chat_routes(app):
                         if not coze_conv_id:
                             coze_conv_id = ev["conversation_id"]
                             db.execute(
-                                "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND token_hash=?",
-                                (coze_conv_id, cid, token_hash),
+                                "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND token_hash=? AND created_at=?",
+                                (coze_conv_id, cid, token_hash, conv_created),
                             )
                         yield sse("meta", {"conversation_id": coze_conv_id})
                     elif ev["type"] == "delta":
@@ -216,14 +271,17 @@ def register_chat_routes(app):
                         content = ev["content"]
                 if content is None:
                     content = "".join(acc)
+                msg_id = save_assistant(content, "ok")
+                saved = True
+                yield sse("done", {"message_id": msg_id, "content": content, "status": "ok"})
             except CozeError as exc:
                 content = "".join(acc)
-                err = {"kind": exc.kind, "message": exc.message, "code": exc.code}
-                save_assistant(content, exc.kind)
-                yield sse("error", err)
-                return
+                if not saved:
+                    save_assistant(content, exc.kind)
+                yield sse("error", {"kind": exc.kind, "message": exc.message, "code": exc.code})
             except (asyncio.CancelledError, GeneratorExit):
-                save_assistant("".join(acc), "interrupted")
+                if not saved:
+                    save_assistant("".join(acc), "interrupted")
                 raise
             except Exception:
                 # 未知错误：不向浏览器暴露内部细节，保留脱敏日志
@@ -231,16 +289,15 @@ def register_chat_routes(app):
 
                 logging.getLogger("mcu.chat").exception("stream failed conv=%s", cid)
                 content = "".join(acc)
-                save_assistant(content, "other")
+                if not saved:
+                    save_assistant(content, "other")
                 yield sse("error", {"kind": "other", "message": "回复生成失败，可查看历史后重发"})
-                return
             finally:
-                lock.release()
-            msg_id = save_assistant(content, "ok")
-            yield sse("done", {"message_id": msg_id, "content": content, "status": "ok"})
+                guard.release()
 
-        return StreamingResponse(
+        return _GuardedStreamingResponse(
             gen(),
+            guard,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
