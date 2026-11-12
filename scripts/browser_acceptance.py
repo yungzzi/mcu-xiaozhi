@@ -52,7 +52,8 @@ def main() -> int:
         console_errors: list[str] = []
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 390, "height": 844})  # 手机尺寸
+            context = browser.new_context(viewport={"width": 390, "height": 844})  # 手机尺寸
+            page = context.new_page()
             page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
 
             # 1. 登录
@@ -130,6 +131,23 @@ def main() -> int:
             # 记录附件 URL，供退出后隔离验证
             att_urls = page.evaluate(
                 "Array.from(document.querySelectorAll('.msg.user .attachment-thumb')).map(i => i.src)")
+
+            # 7.5 生成中删除 → 409 提示，历史列表保留（审阅三轮）
+            # 注意：必须用新标签页打开历史页，保持聊天页 SSE 连接存活，否则导航会中断生成
+            page.fill("#input", "/mock slow " + "长" * 200)
+            page.click("#send")
+            page.wait_for_selector(".msg.assistant .body.streaming", timeout=5000)
+            hist = page.context.new_page()
+            hist.goto(f"{BASE}/history")
+            dialog_msgs = []
+            hist.on("dialog", lambda d: (dialog_msgs.append(d.message), d.accept()))
+            hist.click(".del-conv")
+            hist.wait_for_timeout(800)
+            check("生成中删除弹出 409 提示",
+                  any("正在生成" in m for m in dialog_msgs), str(dialog_msgs))
+            check("删除被拒后历史列表保留", hist.locator(".conv-list li").count() >= 1)
+            hist.close()
+            page.wait_for_selector(".msg.assistant .body.streaming", state="detached", timeout=30000)
 
             # 8. 退出 → 重登 → 旧附件 URL 不得命中缓存（no-store + 归属校验）
             page.click('form[action*="logout"] button')
