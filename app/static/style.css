@@ -1,0 +1,68 @@
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --text: #1f2329;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --border: #e5e7eb;
+  --error: #b91c1c;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+}
+.brand { font-weight: 600; }
+.container { max-width: 720px; margin: 0 auto; padding: 16px; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+h1 { font-size: 1.2rem; margin: 0 0 8px; }
+h2 { font-size: 1.05rem; margin: 0 0 8px; }
+.hint { color: var(--muted); font-size: 0.85rem; margin: 4px 0 12px; }
+.error { color: var(--error); font-size: 0.9rem; }
+label { display: block; margin: 10px 0; font-size: 0.9rem; }
+label.checkbox { display: flex; align-items: center; gap: 8px; }
+input[type="text"], input[type="password"], input:not([type]) {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 1rem;
+}
+button {
+  margin-top: 12px;
+  padding: 10px 18px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 1rem;
+  cursor: pointer;
+}
+button.linklike {
+  background: none;
+  color: var(--accent);
+  margin: 0;
+  padding: 4px 8px;
+  font-size: 0.9rem;
+}
+.login-card { max-width: 420px; margin: 8vh auto 0; }

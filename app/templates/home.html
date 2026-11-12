@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}MCU 小智{% endblock %}
+{% block topbar_right %}
+<form method="post" action="{{ url_for('logout') }}">
+  <button class="linklike" type="submit">退出登录</button>
+</form>
+{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>聊天功能即将上线</h1>
+  <p class="hint">登录会话已建立。聊天、历史与图片功能在后续分支实现。</p>
+  {% if msg %}<p class="error">{{ msg }}</p>{% endif %}
+</div>
+<div class="card">
+  <h2>修改共享密码</h2>
+  <p class="hint">修改后所有设备上的旧登录都会失效，需要重新登录。</p>
+  <form method="post" action="{{ url_for('change_password') }}">
+    <label>当前密码
+      <input name="current" type="password" autocomplete="current-password" required>
+    </label>
+    <label>新密码（至少 8 位）
+      <input name="new" type="password" autocomplete="new-password" minlength="8" required>
+    </label>
+    <button type="submit">修改密码</button>
+  </form>
+</div>
+{% endblock %}
