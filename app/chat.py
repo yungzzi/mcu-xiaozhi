@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -50,6 +51,12 @@ class _GuardedStreamingResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
+            # 显式关闭可能暂停在 yield 的生成器：触发中断记录与上游清理，
+            # 收尾完成后再释放锁（审阅三轮 P2）。
+            try:
+                await self.body_iterator.aclose()
+            except Exception:
+                logging.getLogger("mcu.chat").exception("stream aclose failed")
             self._guard.release()
 
 
@@ -187,6 +194,15 @@ def register_chat_routes(app):
         await lock.acquire()
         guard = _LockGuard(lock)
 
+        # 取锁后、首次写入前重新校验会话（审阅三轮 P1）：
+        # 等待请求体期间旧聊天可能已被删除、整数 ID 被新聊天复用；
+        # 必须确认存在、归属一致、且仍是原会话（created_at 身份）才能写入。
+        conv_now = owned_conv(session, cid)
+        if conv_now is None or conv_now["created_at"] != conv["created_at"]:
+            guard.release()
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        conv = conv_now
+
         # 取锁后到流开始前的所有步骤都在释放保护内
         try:
             file_ids = []
@@ -247,15 +263,16 @@ def register_chat_routes(app):
             content = None
             saved = False
             nonlocal coze_conv_id
+            stream = app.state.coze.stream_chat(
+                ChatRequest(
+                    user_id=coze_user_id,
+                    conversation_id=coze_conv_id,
+                    text=text,
+                    file_ids=file_ids or None,
+                )
+            )
             try:
-                async for ev in app.state.coze.stream_chat(
-                    ChatRequest(
-                        user_id=coze_user_id,
-                        conversation_id=coze_conv_id,
-                        text=text,
-                        file_ids=file_ids or None,
-                    )
-                ):
+                async for ev in stream:
                     if ev["type"] == "meta":
                         if not coze_conv_id:
                             coze_conv_id = ev["conversation_id"]
@@ -285,14 +302,15 @@ def register_chat_routes(app):
                 raise
             except Exception:
                 # 未知错误：不向浏览器暴露内部细节，保留脱敏日志
-                import logging
-
                 logging.getLogger("mcu.chat").exception("stream failed conv=%s", cid)
                 content = "".join(acc)
                 if not saved:
                     save_assistant(content, "other")
                 yield sse("error", {"kind": "other", "message": "回复生成失败，可查看历史后重发"})
             finally:
+                # 先收尾再释放锁（审阅三轮 P2）：显式关闭上游扣子流，
+                # 完成连接清理；中断记录已在 except 分支落库。
+                await stream.aclose()
                 guard.release()
 
         return _GuardedStreamingResponse(

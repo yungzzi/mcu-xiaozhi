@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.auth import COOKIE_NAME
+from app.db import now
 from conftest import PASSWORD, login
 from test_chat import parse_sse
 
@@ -42,28 +43,41 @@ def make_scope(cookie: str, cid: int, body: bytes) -> dict:
 
 
 async def drive_send(app, cookie: str, cid: int, payload: dict, fail_at: str):
-    """直接驱动 ASGI 应用，模拟不同阶段的客户端断连。"""
+    """直接驱动 ASGI 应用，模拟不同阶段的客户端断连。
+
+    返回实际发出的 ASGI 消息类型序列，供断言故障发生阶段。
+    fail_at="body" 在第 3 个 body 分片处抛错（确保已进入流式分片阶段）。
+    """
     body = json.dumps(payload).encode()
     scope = make_scope(cookie, cid, body)
     request_sent = False
+    seen = []
+    body_count = 0
+    hold = asyncio.Event()  # 保持连接打开，避免提前触发 starlette 断连监听
 
     async def receive():
         nonlocal request_sent
         if not request_sent:
             request_sent = True
             return {"type": "http.request", "body": body, "more_body": False}
+        await hold.wait()
         return {"type": "http.disconnect"}
 
     async def send(msg):
+        nonlocal body_count
+        seen.append(msg["type"])
         if fail_at == "start" and msg["type"] == "http.response.start":
             raise IOError("simulated disconnect at response headers")
         if fail_at == "body" and msg["type"] == "http.response.body":
-            raise IOError("simulated disconnect during body chunk")
+            body_count += 1
+            if body_count >= 3:
+                raise IOError("simulated disconnect during body chunk")
 
     try:
         await app(scope, receive, send)
     except IOError:
         pass
+    return seen
 
 
 @pytest.fixture
@@ -93,13 +107,30 @@ def test_disconnect_mid_body_then_resend(app, env):
     c, cookie, cid = env
 
     async def run():
-        await drive_send(app, cookie, cid, {"text": "/mock slow 分片断连"}, fail_at="body")
+        seen = await drive_send(app, cookie, cid, {"text": "/mock slow 分片断连"}, fail_at="body")
+        # 故障必须确实发生在分片发送阶段：响应头已发出，且已尝试至少 3 个 body 分片
+        assert seen[0] == "http.response.start"
+        assert seen.count("http.response.body") >= 3, f"未进入分片阶段：{seen}"
         assert not app.state.chat_locks[cid].locked(), "分片断连后锁必须释放"
+        # 中断记录已落库且只写一次
+        rows = app.state.db.query(
+            "SELECT status, content FROM messages WHERE conversation_id=? AND role='assistant'",
+            (cid,),
+        )
+        assert len(rows) == 1, f"中断记录应只写一次：{len(rows)}"
+        assert rows[0]["status"] == "interrupted"
+        assert len(rows[0]["content"]) > 0, "应保存已收到的部分文本"
 
     asyncio.run(run())
     r = c.post(f"/api/conversations/{cid}/send", json={"text": "断连后的新问题"})
     assert r.status_code == 200
     assert parse_sse(r.text)[-1][0] == "done"
+    # 重发后共两条 assistant：一条 interrupted、一条 ok
+    rows = app.state.db.query(
+        "SELECT status FROM messages WHERE conversation_id=? AND role='assistant' ORDER BY id",
+        (cid,),
+    )
+    assert [r["status"] for r in rows] == ["interrupted", "ok"]
 
 
 def test_early_disconnect_releases_lock(app, env):
@@ -225,3 +256,65 @@ def test_concurrent_send_still_409(app):
                 pass
 
     asyncio.run(run())
+
+
+def _drive_with_body_mutation(app, cookie, cid, mutate):
+    """在请求体读取期间执行 mutate（模拟 await request.json() 时会话变化）。"""
+    async def run():
+        body = json.dumps({"text": "旧聊天问题"}).encode()
+        scope = make_scope(cookie, cid, body)
+        mutated = False
+        statuses = []
+
+        async def receive():
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                mutate()
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(msg):
+            if msg["type"] == "http.response.start":
+                statuses.append(msg["status"])
+
+        await app(scope, receive, send)
+        return statuses
+
+    return asyncio.run(run())
+
+
+def test_conv_replaced_during_body_read(app, env):
+    """审阅三轮 P1 回归：读请求体期间旧会话被删且 ID 被复用 → 404，不写入新会话。"""
+    c, cookie, cid = env
+    token_hash = app.state.db.query_one(
+        "SELECT token_hash FROM conversations WHERE id=?", (cid,))["token_hash"]
+
+    def mutate():
+        app.state.db.execute("DELETE FROM conversations WHERE id=?", (cid,))
+        app.state.db.execute(
+            "INSERT INTO conversations(id, token_hash, title, created_at, updated_at) VALUES(?,?,?,?,?)",
+            (cid, token_hash, "新对话", now() + 10, now() + 10),
+        )
+
+    statuses = _drive_with_body_mutation(app, cookie, cid, mutate)
+    assert statuses == [404], f"应拒绝复用 ID 的新会话：{statuses}"
+    assert not app.state.chat_locks[cid].locked()
+    msgs = app.state.db.query("SELECT * FROM messages WHERE conversation_id=?", (cid,))
+    assert msgs == [], "用户消息不得写入复用 ID 的新会话"
+    # 新会话仍可正常使用
+    r = c.post(f"/api/conversations/{cid}/send", json={"text": "新会话的问题"})
+    assert r.status_code == 200
+    assert parse_sse(r.text)[-1][0] == "done"
+
+
+def test_conv_deleted_during_body_read(app, env):
+    """读请求体期间会话被删除（无复用）→ 404，锁释放。"""
+    c, cookie, cid = env
+
+    def mutate():
+        app.state.db.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
+        app.state.db.execute("DELETE FROM conversations WHERE id=?", (cid,))
+
+    statuses = _drive_with_body_mutation(app, cookie, cid, mutate)
+    assert statuses == [404]
+    assert not app.state.chat_locks[cid].locked()

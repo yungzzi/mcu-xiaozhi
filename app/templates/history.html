@@ -29,7 +29,12 @@ document.querySelectorAll('.del-conv').forEach(function (btn) {
   btn.addEventListener('click', async function () {
     if (!confirm('删除这条聊天记录？')) return;
     const r = await fetch('api/conversations/' + btn.dataset.id, { method: 'DELETE' });
-    if (r.ok) location.reload();
+    if (r.ok) { location.reload(); return; }
+    if (r.status === 409) {
+      alert('当前聊天正在生成回复，请稍后再删除');
+      return;  // 保留历史列表
+    }
+    alert('删除失败（' + r.status + '），请稍后重试');
   });
 });
 </script>
