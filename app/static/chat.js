@@ -15,11 +15,9 @@
   var busy = false;
   var lastUserText = '';
 
-  /* ---------- 安全 Markdown：先整体转义，再做受限替换 ---------- */
-  function escapeHtml(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
+  /* ---------- 安全 Markdown：纯 DOM 构造，不使用 innerHTML ----------
+   * 文本一律经 textContent 写入；URL 只有通过 safeUrl 校验后才赋给 img.src / a.href，
+   * 后续替换不会改写已生成节点的属性（审阅 P1 修复）。 */
   /* 当前页面目录（兼容 /mcu-xiaozhi/ 反代前缀），用于解析站内根相对路径 */
   var BASE = location.pathname.replace(/[^/]*$/, '');
   function safeUrl(u) {
@@ -27,45 +25,75 @@
     if (u.charAt(0) === '/' && u.charAt(1) !== '/') return BASE + u.slice(1);
     return null;
   }
-  function renderMarkdown(src) {
-    var text = escapeHtml(src);
-    var blocks = [];
-    // 围栏代码块
-    text = text.replace(/```([\w+-]*)\n?([\s\S]*?)```/g, function (_, lang, code) {
-      blocks.push('<pre class="code"><code>' + code.replace(/\n$/, '') + '</code></pre>');
-      return '\u0000B' + (blocks.length - 1) + '\u0000';
+  function makeImage(url, alt, cls) {
+    var img = document.createElement('img');
+    img.className = cls;
+    img.src = url;
+    img.alt = alt || '';
+    img.loading = 'lazy';
+    img.addEventListener('error', function () {
+      var a = document.createElement('a');
+      a.href = url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = '图片加载失败，点击查看原图链接';
+      img.replaceWith(a);
     });
-    // 图片（仅 http/https；加载失败降级为链接，见 attachImageFallback）
-    text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, function (_, alt, url) {
-      var u = safeUrl(url);
-      if (!u) return alt || url;
-      return '<img class="plugin-img" src="' + u + '" alt="' + alt + '" loading="lazy">';
-    });
-    // 链接
-    text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, t, url) {
-      var u = safeUrl(url);
-      if (!u) return t;
-      return '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + t + '</a>';
-    });
-    // 行内代码与加粗
-    text = text.replace(/`([^`\n]+)`/g, '<code class="inline">$1</code>');
-    text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-    // 段落换行（代码块占位符前后不插 br）
-    text = text.replace(/\n/g, '<br>');
-    text = text.replace(/\u0000B(\d+)\u0000/g, function (_, i) { return blocks[Number(i)]; });
-    return text;
+    return img;
   }
-  function attachImageFallback(root) {
-    root.querySelectorAll('img.plugin-img').forEach(function (img) {
-      img.addEventListener('error', function () {
-        var a = document.createElement('a');
-        a.href = img.src;
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
-        a.textContent = '图片加载失败，点击查看原图链接';
-        img.replaceWith(a);
-      });
-    });
+  var INLINE_RE = /!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)|`([^`\n]+)`|\*\*([^*\n]+)\*\*|\n/g;
+  function renderInlineInto(container, text) {
+    var last = 0, m;
+    INLINE_RE.lastIndex = 0;
+    while ((m = INLINE_RE.exec(text)) !== null) {
+      if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
+      if (m[2] !== undefined) {            // 图片 ![alt](url)
+        var iu = safeUrl(m[2]);
+        if (iu) container.appendChild(makeImage(iu, m[1], 'plugin-img'));
+        else container.appendChild(document.createTextNode(m[1] || m[2]));
+      } else if (m[4] !== undefined) {     // 链接 [text](url)
+        var lu = safeUrl(m[4]);
+        if (lu) {
+          var a = document.createElement('a');
+          a.href = lu;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.textContent = m[3];
+          container.appendChild(a);
+        } else {
+          container.appendChild(document.createTextNode(m[3]));
+        }
+      } else if (m[5] !== undefined) {     // 行内代码
+        var c = document.createElement('code');
+        c.className = 'inline';
+        c.textContent = m[5];
+        container.appendChild(c);
+      } else if (m[6] !== undefined) {     // 加粗
+        var b = document.createElement('strong');
+        b.textContent = m[6];
+        container.appendChild(b);
+      } else {                             // 换行
+        container.appendChild(document.createElement('br'));
+      }
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
+  }
+  function renderMarkdownInto(container, src) {
+    container.textContent = '';
+    var fenceRe = /```([\w+-]*)\n?([\s\S]*?)```/g;
+    var last = 0, m;
+    while ((m = fenceRe.exec(src)) !== null) {
+      if (m.index > last) renderInlineInto(container, src.slice(last, m.index));
+      var pre = document.createElement('pre');
+      pre.className = 'code';
+      var code = document.createElement('code');
+      code.textContent = m[2].replace(/\n$/, '');
+      pre.appendChild(code);
+      container.appendChild(pre);
+      last = m.index + m[0].length;
+    }
+    if (last < src.length) renderInlineInto(container, src.slice(last));
   }
 
   /* ---------- 消息渲染 ---------- */
@@ -82,8 +110,7 @@
   function renderStored(m) {
     var body = bubble(m.role);
     if (m.role === 'assistant') {
-      body.innerHTML = renderMarkdown(m.content);
-      attachImageFallback(body);
+      renderMarkdownInto(body, m.content);
       if (m.status && m.status !== 'ok') {
         var tag = document.createElement('div');
         tag.className = 'status-tag';
@@ -107,6 +134,7 @@
       quota: '额度已耗尽',
       auth: '凭证失效，请联系管理员',
       interrupted: '回复中断',
+      action_required: '智能体需要额外操作（如端插件授权），本轮未完成',
       network: '网络错误',
       other: '生成失败'
     }[kind] || '生成失败';
@@ -203,14 +231,12 @@
           } else if (ev.event === 'done') {
             finished = true;
             liveBody.classList.remove('streaming');
-            liveBody.innerHTML = renderMarkdown(ev.data.content);
-            attachImageFallback(liveBody);
+            renderMarkdownInto(liveBody, ev.data.content);
           } else if (ev.event === 'error') {
             finished = true;
             liveBody.classList.remove('streaming');
             if (acc) {
-              liveBody.innerHTML = renderMarkdown(acc);
-              attachImageFallback(liveBody);
+              renderMarkdownInto(liveBody, acc);
             } else {
               liveBody.parentElement.remove();
             }
@@ -221,8 +247,7 @@
       if (!finished) {
         liveBody.classList.remove('streaming');
         if (acc) {
-          liveBody.innerHTML = renderMarkdown(acc);
-          attachImageFallback(liveBody);
+          renderMarkdownInto(liveBody, acc);
         }
         showBanner('interrupted', '连接结束但未收到完整回复');
       }

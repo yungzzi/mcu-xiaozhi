@@ -188,3 +188,40 @@ def test_code_block_in_reply(auth_client):
     r = auth_client.post(f"/api/conversations/{cid}/send", json={"text": "给我一段代码示例"})
     done = parse_sse(r.text)[-1][1]
     assert "```python" in done["content"]
+
+
+def test_invalid_types_do_not_hold_lock(auth_client):
+    """审阅 P1 回归：取锁前类型校验失败后，同一聊天仍能正常发送。"""
+    cid = new_conv(auth_client)
+    assert auth_client.post(f"/api/conversations/{cid}/send", json={"text": 123}).status_code == 400
+    assert auth_client.post(f"/api/conversations/{cid}/send",
+                            json={"text": "x", "attachment_ids": "not-a-list"}).status_code == 400
+    assert auth_client.post(f"/api/conversations/{cid}/send",
+                            json={"text": "x", "attachment_ids": [True]}).status_code == 400
+    assert auth_client.post(f"/api/conversations/{cid}/send",
+                            json={"text": "x", "attachment_ids": ["1"]}).status_code == 400
+    assert auth_client.post(f"/api/conversations/{cid}/send", json=[1, 2]).status_code == 400
+    # 锁未被占用：正常发送成功
+    r = auth_client.post(f"/api/conversations/{cid}/send", json={"text": "正常问题"})
+    assert r.status_code == 200
+    assert parse_sse(r.text)[-1][0] == "done"
+
+
+def test_missing_attachment_then_send_ok(auth_client):
+    """取锁后附件校验失败也必须释放锁。"""
+    cid = new_conv(auth_client)
+    r = auth_client.post(f"/api/conversations/{cid}/send",
+                         json={"text": "x", "attachment_ids": [99999]})
+    assert r.status_code == 404
+    r = auth_client.post(f"/api/conversations/{cid}/send", json={"text": "后续问题"})
+    assert r.status_code == 200
+    assert parse_sse(r.text)[-1][0] == "done"
+
+
+def test_multi_answer_mock_history_complete(auth_client):
+    cid = new_conv(auth_client)
+    r = auth_client.post(f"/api/conversations/{cid}/send", json={"text": "/mock multi"})
+    done = parse_sse(r.text)[-1][1]
+    assert "第二段回答" in done["content"]
+    msgs = auth_client.get(f"/api/conversations/{cid}/messages").json()["messages"]
+    assert msgs[1]["content"] == done["content"]

@@ -49,6 +49,8 @@ class MockCozeClient:
             parts.append(f"\n课程配图：\n![课程配图]({SAMPLE_IMAGE})\n")
         if "/mock brokenimage" in text:
             parts.append(f"\n![加载失败的图]({BROKEN_IMAGE})\n")
+        if "/mock multi" in text:
+            parts.append("\n\n【第二段回答】这是多 answer 场景的第二条回复，页面与历史都应完整保留。")
         if req.file_ids:
             parts.append(f"\n（已收到 {len(req.file_ids)} 张图片，file_id={','.join(req.file_ids)}）")
         reply = "".join(parts)

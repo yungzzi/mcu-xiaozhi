@@ -126,8 +126,18 @@ def register_chat_routes(app):
             body = await request.json()
         except ValueError:
             return JSONResponse({"error": "bad_json"}, status_code=400)
-        text = (body.get("text") or "").strip()
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "bad_json"}, status_code=400)
+        # 类型校验必须在取锁之前完成，避免异常路径占锁（审阅 P1 修复）
+        raw_text = body.get("text", "")
+        if not isinstance(raw_text, str):
+            return JSONResponse({"error": "bad_text"}, status_code=400)
+        text = raw_text.strip()
         attachment_ids = body.get("attachment_ids") or []
+        if not isinstance(attachment_ids, list) or any(
+            not isinstance(a, int) or isinstance(a, bool) for a in attachment_ids
+        ):
+            return JSONResponse({"error": "bad_attachment_ids"}, status_code=400)
         if not text and not attachment_ids:
             return JSONResponse({"error": "empty"}, status_code=400)
 
@@ -136,30 +146,34 @@ def register_chat_routes(app):
             return JSONResponse({"error": "busy", "message": "当前聊天正在生成回复，请稍候"}, status_code=409)
         await lock.acquire()
 
-        # 校验附件归属（附件功能在分支3启用，这里先做归属检查）
-        file_ids = []
-        att_rows = []
-        for aid in attachment_ids:
-            att = db.query_one(
-                "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
-            )
-            if att is None:
-                lock.release()
-                return JSONResponse({"error": "attachment_not_found"}, status_code=404)
-            att_rows.append(att)
-            if att["coze_file_id"]:
-                file_ids.append(att["coze_file_id"])
+        # 取锁后到流开始前的所有步骤都在释放保护内
+        try:
+            file_ids = []
+            att_rows = []
+            for aid in attachment_ids:
+                att = db.query_one(
+                    "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
+                )
+                if att is None:
+                    lock.release()
+                    return JSONResponse({"error": "attachment_not_found"}, status_code=404)
+                att_rows.append(att)
+                if att["coze_file_id"]:
+                    file_ids.append(att["coze_file_id"])
 
-        user_cur = db.execute(
-            "INSERT INTO messages(conversation_id, role, content, status, created_at) VALUES(?,?,?,?,?)",
-            (cid, "user", text, "ok", now()),
-        )
-        user_msg_id = user_cur.lastrowid
-        for att in att_rows:
-            db.execute("UPDATE attachments SET message_id=? WHERE id=?", (user_msg_id, att["id"]))
-        if conv["title"] == "新对话" and text:
-            db.execute("UPDATE conversations SET title=? WHERE id=?", (text[:30], cid))
-        db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
+            user_cur = db.execute(
+                "INSERT INTO messages(conversation_id, role, content, status, created_at) VALUES(?,?,?,?,?)",
+                (cid, "user", text, "ok", now()),
+            )
+            user_msg_id = user_cur.lastrowid
+            for att in att_rows:
+                db.execute("UPDATE attachments SET message_id=? WHERE id=?", (user_msg_id, att["id"]))
+            if conv["title"] == "新对话" and text:
+                db.execute("UPDATE conversations SET title=? WHERE id=?", (text[:30], cid))
+            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
+        except Exception:
+            lock.release()
+            raise
 
         coze_conv_id = conv["coze_conversation_id"]
         token_hash = session["token_hash"]

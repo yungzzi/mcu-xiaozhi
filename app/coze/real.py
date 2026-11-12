@@ -82,8 +82,14 @@ class RealCozeClient:
         if req.conversation_id:
             params["conversation_id"] = req.conversation_id
 
-        answer_parts: list[str] = []
-        final_content: str | None = None
+        # 整轮状态（审阅 P1 修复）：
+        # - 以 conversation.chat.completed 为整轮完成标志；正常 EOF 但无完成事件 → interrupted
+        # - conversation.chat.requires_action → action_required（需上报工具结果，首版不自动处理）
+        # - 多 answer 场景：按序收集每条 message.completed(type=answer) 的完整内容，全部保留
+        completed_answers: list[str] = []
+        delta_buf: dict[str, list[str]] = {}
+        chat_completed = False
+        requires_action = False
         conv_id = req.conversation_id
         meta_sent = False
         event_name = ""
@@ -106,7 +112,7 @@ class RealCozeClient:
                     if not line.startswith("data:"):
                         continue
                     data_raw = line[5:].strip()
-                    if data_raw == "[DONE]":
+                    if data_raw in ("[DONE]", '"[DONE]"'):
                         break
                     try:
                         data = json.loads(data_raw)
@@ -120,13 +126,19 @@ class RealCozeClient:
                     elif event_name == "conversation.message.delta":
                         if data.get("type") == "answer":
                             piece = data.get("content", "")
-                            answer_parts.append(piece)
+                            mid = str(data.get("id", ""))
+                            delta_buf.setdefault(mid, []).append(piece)
                             yield {"type": "delta", "text": piece}
                     elif event_name == "conversation.message.completed":
                         if data.get("type") == "answer":
-                            final_content = data.get("content", "")
+                            completed_answers.append(data.get("content", ""))
+                    elif event_name == "conversation.chat.completed":
+                        chat_completed = True
+                    elif event_name == "conversation.chat.requires_action":
+                        requires_action = True
                     elif event_name == "conversation.chat.failed":
-                        err = data.get("last_error") or {}
+                        # 官方示例 data 直接为 {code, msg}；兼容 last_error 包裹格式
+                        err = data.get("last_error") or data
                         kind = classify(err.get("code"), err.get("msg", ""))
                         raise CozeError(kind, f"生成失败：{err.get('msg', '')}", code=err.get("code"))
                     elif event_name == "error":
@@ -135,7 +147,18 @@ class RealCozeClient:
         except httpx.HTTPError as exc:
             raise CozeError("network", f"网络错误：{exc.__class__.__name__}") from exc
 
-        content = final_content if final_content is not None else "".join(answer_parts)
+        if requires_action:
+            raise CozeError(
+                "action_required",
+                "智能体需要额外操作（如端插件授权），本轮未完成",
+            )
+        if not chat_completed:
+            raise CozeError("interrupted", "连接提前结束，未收到整轮完成事件")
+
+        if completed_answers:
+            content = "\n\n".join(completed_answers)
+        else:
+            content = "".join("".join(parts) for parts in delta_buf.values())
         if not meta_sent and conv_id:
             yield {"type": "meta", "conversation_id": conv_id}
         yield {"type": "done", "content": content}
