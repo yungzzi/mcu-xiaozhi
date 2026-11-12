@@ -102,6 +102,24 @@ location /mcu-xiaozhi/ {
 - [ ] https://47.116.68.205/mcu-xiaozhi/login 可访问，登录跳转 /mcu-xiaozhi/chat
 - [ ] 静态文件 200；逐段回复可见（SSE）
 - [ ] 上传一张图片并图文问答（真实扣子，计入联调预算另行确认）
-- [ ] 历史图片仅本会话可见；退出后旧附件 URL 404
-- [ ] /v360/ 照常访问；swim-kick-tracker 与 personal-proxy-center 不受影响
-- [ ] 重启容器后历史与图片仍在
+- [x] 历史图片仅本会话可见；退出后旧附件 URL 404（本地浏览器验收已证；生产待图文联调复核）
+- [x] /v360/ 照常访问；swim-kick-tracker 与 personal-proxy-center 不受影响
+- [x] 重启容器后历史与图片仍在（同一会话 Cookie 跨重启验证）
+
+## 8. 部署执行记录（2026-11-12，用户批准后执行）
+
+- 镜像：mcu-xiaozhi:0.1.1 由 main d651e55 重建，docker save/load 离线导入（54.7MB）
+- 目录：/srv/mcu-xiaozhi/{data,uploads,secrets}；凭证 install -o 1000 -g 1000 -m 0400，
+  secrets 目录 0700；.env 0600（MCU_USERNAME=shaodadianxin，COZE_MODE=real）
+- 容器：mcu-xiaozhi-mcu-xiaozhi-1 healthy；容器内确认两个 secret 可读
+- nginx：备份 /home/yungzzi/mcu-staging/swim-kick-tracker.bak-mcu-xiaozhi；
+  新增 snippets/mcu-xiaozhi.conf + 443 站点 include 一行（grep 计数=1）；
+  nginx -t 通过后 systemctl reload
+- 公网验收（https://47.116.68.205/mcu-xiaozhi/）：
+  登录页 200 且静态 URL 带前缀；静态 css 200；正确凭证登录 303→/mcu-xiaozhi/chat 200；
+  错误密码 401；healthz ok；建会话成功；同一 Cookie 跨容器重启历史仍在
+- 在跑服务基线对比：/ 、/v360/、/swim-kick-tracker/、/personal-proxy-center/
+  变更前后均 200；v360-web-v360-1 持续 healthy（Up 8 days）
+- 回滚就绪：nginx 备份 + 上一版镜像 tag 流程见第 5 节
+- 待办：经 nginx 的 SSE 逐段回复验证需 1 次真实扣子请求，按额度规则另行确认后执行；
+  生产图文问答验收 likewise。建议上线后轮换共享密码（rotate_password.py）
