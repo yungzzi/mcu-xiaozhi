@@ -68,6 +68,10 @@ def main() -> int:
             page.fill("#input", "给我代码示例和配图 /mock image")
             page.click("#send")
             page.wait_for_selector(".msg.assistant .body.streaming", timeout=5000)
+            page.wait_for_function(
+                "document.querySelector('.msg.assistant .body.streaming') && "
+                "document.querySelector('.msg.assistant .body.streaming').textContent.length > 0",
+                timeout=5000)
             partial = page.text_content(".msg.assistant .body.streaming") or ""
             check("流式增量渲染（生成中已有部分文本）", len(partial) > 0, f"partial={len(partial)} chars")
             page.wait_for_selector(".msg.assistant .body.streaming", state="detached", timeout=15000)
@@ -150,6 +154,10 @@ def main() -> int:
             page.wait_for_selector(".msg.assistant .body.streaming", state="detached", timeout=30000)
 
             # 8. 退出 → 重登 → 旧附件 URL 不得命中缓存（no-store + 归属校验）
+            # 移动端视口下退出按钮在侧栏抽屉里，先打开抽屉
+            if page.locator("#menu-btn").is_visible():
+                page.click("#menu-btn")
+                page.wait_for_selector("#sidebar.open", timeout=5000)
             page.click('form[action*="logout"] button')
             page.wait_for_url("**/login")
             page.fill('input[name="username"]', "mcu")
