@@ -1,4 +1,4 @@
-"""FastAPI 应用入口：登录/退出/改密 + 页面骨架。聊天与上传在后续分支加入。"""
+"""FastAPI 应用入口：登录/退出 + 页面骨架；聊天与上传路由分别注册。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -43,8 +43,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def current_session(request: Request):
         return auth.get_session(request.cookies.get(COOKIE_NAME))
 
+    def prefixed(name: str) -> str:
+        # app.url_path_for 不含 root_path；重定向必须带反代前缀
+        return settings.root_path + app.url_path_for(name)
+
     def login_redirect() -> RedirectResponse:
-        return RedirectResponse(app.url_path_for("login_page"), status_code=303)
+        return RedirectResponse(prefixed("login_page"), status_code=303)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():
@@ -58,13 +62,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/", include_in_schema=False)
     def index(request: Request):
         if current_session(request):
-            return RedirectResponse(app.url_path_for("chat_page"), status_code=303)
+            return RedirectResponse(prefixed("chat_page"), status_code=303)
         return login_redirect()
 
     @app.get("/login", name="login_page")
     def login_page(request: Request, msg: str = ""):
         if current_session(request):
-            return RedirectResponse(app.url_path_for("chat_page"), status_code=303)
+            return RedirectResponse(prefixed("chat_page"), status_code=303)
         return templates.TemplateResponse(request, "login.html", {"msg": msg})
 
     @app.post("/login")
@@ -79,7 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request, "login.html", {"msg": "账号或密码不正确"}, status_code=401
             )
         token, max_age = auth.create_session(username, remember == "on")
-        resp = RedirectResponse(app.url_path_for("chat_page"), status_code=303)
+        resp = RedirectResponse(prefixed("chat_page"), status_code=303)
         resp.set_cookie(
             COOKIE_NAME,
             token,
@@ -96,7 +100,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         token = request.cookies.get(COOKIE_NAME)
         if token:
             auth.revoke(token)
-        resp = RedirectResponse(app.url_path_for("login_page"), status_code=303)
+        resp = RedirectResponse(prefixed("login_page"), status_code=303)
         resp.delete_cookie(COOKIE_NAME, path=settings.root_path or "/")
         return resp
 

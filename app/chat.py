@@ -73,6 +73,9 @@ def register_chat_routes(app):
     def session_of(request: Request):
         return auth.get_session(request.cookies.get(COOKIE_NAME))
 
+    def login_redirect():
+        return RedirectResponse(settings.root_path + app.url_path_for("login_page"), status_code=303)
+
     def unauthorized():
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
@@ -85,14 +88,14 @@ def register_chat_routes(app):
     def chat_page(request: Request):
         session = session_of(request)
         if session is None:
-            return RedirectResponse(app.url_path_for("login_page"), status_code=303)
+            return login_redirect()
         return templates.TemplateResponse(request, "chat.html", {})
 
     @app.get("/history", name="history_page")
     def history_page(request: Request):
         session = session_of(request)
         if session is None:
-            return RedirectResponse(app.url_path_for("login_page"), status_code=303)
+            return login_redirect()
         convs = db.query(
             "SELECT id, title, updated_at FROM conversations WHERE token_hash=? ORDER BY updated_at DESC",
             (session["token_hash"],),
