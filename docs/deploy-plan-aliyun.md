@@ -123,3 +123,20 @@ location /mcu-xiaozhi/ {
 - 回滚就绪：nginx 备份 + 上一版镜像 tag 流程见第 5 节
 - 待办：经 nginx 的 SSE 逐段回复验证需 1 次真实扣子请求，按额度规则另行确认后执行；
   生产图文问答验收 likewise。建议上线后轮换共享密码（rotate_password.py）
+## 9. 上线后热修记录（2026-11-12 晚）
+
+用户浏览器实测发现两个入口问题，已修复并验证：
+
+1. HTTP 访问 404：80 端口 default 站点无 /mcu-xiaozhi/ 路由。
+   修复：default 站点新增两条 location，301 跳转 HTTPS（备份
+   /home/yungzzi/mcu-staging/default.bak-mcu-xiaozhi；nginx -t 通过后 reload）。
+2. 登录 POST 被降级为 GET 跳回 /login：后端未识别 X-Forwarded-Proto，
+   模板生成 http 绝对地址的表单 action；http POST 遇 301 变 GET。
+   修复分支 qwen/proxy-headers（ef2df71 + 96e1be5）：uvicorn 启用
+   --proxy-headers；--forwarded-allow-ips 初设 127.0.0.1 无效（docker NAT
+   源 IP 为网关），改 "*"（容器端口仅绑宿主 127.0.0.1，仅本机 nginx 可达）。
+   镜像 0.1.3 部署，表单 action 变 https。
+
+验证：公网浏览器全流程 HTTP→HTTPS→登录→chat 通过；已登录直访 /chat 不再跳回；
+在跑服务基线全部 200 不变。回滚 tag：0.1.1 / 0.1.2 保留。
+qwen/proxy-headers 待审阅批准后合入 main。
