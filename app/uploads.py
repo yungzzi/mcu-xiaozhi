@@ -86,5 +86,6 @@ def register_upload_routes(app):
         return FileResponse(
             path,
             media_type=att["mime"],
-            headers={"Cache-Control": "private, max-age=86400", "Content-Disposition": "inline"},
+            # no-store：私有附件不得命中浏览器缓存，退出后同 URL 必须重新走归属校验（审阅 P2）
+            headers={"Cache-Control": "no-store", "Content-Disposition": "inline"},
         )

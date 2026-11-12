@@ -208,7 +208,7 @@ def register_chat_routes(app):
             conv = conv_now
 
             file_ids = []
-            att_rows = []
+            link_ids = []  # 将关联到新消息的附件行 id
             for aid in attachment_ids:
                 att = db.query_one(
                     "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
@@ -216,7 +216,18 @@ def register_chat_routes(app):
                 if att is None:
                     guard.release()
                     return JSONResponse({"error": "attachment_not_found"}, status_code=404)
-                att_rows.append(att)
+                if att["message_id"] is None:
+                    link_ids.append(att["id"])
+                else:
+                    # 重发：复制一条新索引行（共用磁盘文件与 coze_file_id），
+                    # 不改动旧消息与附件的关联（审阅 P2 修复）
+                    copy_cur = db.execute(
+                        "INSERT INTO attachments(token_hash, orig_name, stored_name, mime, size, coze_file_id, created_at)"
+                        " VALUES(?,?,?,?,?,?,?)",
+                        (session["token_hash"], att["orig_name"], att["stored_name"],
+                         att["mime"], att["size"], att["coze_file_id"], now()),
+                    )
+                    link_ids.append(copy_cur.lastrowid)
                 if att["coze_file_id"]:
                     file_ids.append(att["coze_file_id"])
 
@@ -225,8 +236,8 @@ def register_chat_routes(app):
                 (cid, "user", text, "ok", now()),
             )
             user_msg_id = user_cur.lastrowid
-            for att in att_rows:
-                db.execute("UPDATE attachments SET message_id=? WHERE id=?", (user_msg_id, att["id"]))
+            for att_id in link_ids:
+                db.execute("UPDATE attachments SET message_id=? WHERE id=?", (user_msg_id, att_id))
             if conv["title"] == "新对话" and text:
                 db.execute("UPDATE conversations SET title=? WHERE id=?", (text[:30], cid))
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))

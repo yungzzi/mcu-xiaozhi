@@ -111,3 +111,37 @@ def test_coze_upload_failure(auth_client):
     r = upload(auth_client, "fail-upload.png", PNG)
     assert r.status_code == 502
     assert r.json()["kind"] == "network"
+
+
+def test_attachment_no_store(auth_client):
+    """审阅 P2：私有附件必须 no-store，退出后不得命中浏览器缓存。"""
+    aid = upload(auth_client).json()["id"]
+    r = auth_client.get(f"/api/attachments/{aid}")
+    assert r.status_code == 200
+    assert "no-store" in r.headers["cache-control"]
+
+
+def test_resend_keeps_old_attachment_link(auth_client, app):
+    """审阅 P2 回归：带图重发后两条历史都显示原图，旧关联不被挪走。"""
+    aid = upload(auth_client).json()["id"]
+    cid = auth_client.post("/api/conversations").json()["id"]
+    auth_client.post(f"/api/conversations/{cid}/send",
+                     json={"text": "第一次看图", "attachment_ids": [aid]})
+    auth_client.post(f"/api/conversations/{cid}/send",
+                     json={"text": "重发再看一次", "attachment_ids": [aid]})
+    msgs = auth_client.get(f"/api/conversations/{cid}/messages").json()["messages"]
+    users = [m for m in msgs if m["role"] == "user"]
+    assert len(users) == 2
+    assert len(users[0]["attachments"]) == 1
+    assert len(users[1]["attachments"]) == 1
+    aid1 = users[0]["attachments"][0]["id"]
+    aid2 = users[1]["attachments"][0]["id"]
+    assert aid1 == aid and aid2 != aid  # 旧关联不变，新消息用复制行
+    # 两条历史的图片都能读取且内容一致
+    r1 = auth_client.get(f"/api/attachments/{aid1}")
+    r2 = auth_client.get(f"/api/attachments/{aid2}")
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.content == r2.content == PNG
+    # 数据库层面旧行的 message_id 仍指向第一条消息
+    old = app.state.db.query_one("SELECT message_id FROM attachments WHERE id=?", (aid,))
+    assert old["message_id"] == users[0]["id"]
