@@ -22,5 +22,5 @@ MCU 小智课程助手网页版：把运行在扣子（Coze 国内版）上的�
 ## 待补项
 
 - [ ] 原智能体的两个旧 Python 文件（拿到后脱敏检查再归档到 `archive/`）
-- [ ] 真实扣子 PAT 令牌与 bot_id（由用户写入服务器受限文件，经 Compose secret 挂载）
+- [ ] 真实扣子 SAT 令牌（已开通 chat 与 uploadFile 权限）与 bot_id（由用户写入服务器受限文件，经 Compose secret 挂载）
 - [ ] 插件图床 URL 实际样例（联调时确认返回格式）

@@ -8,6 +8,7 @@ COPY requirements.lock.txt ./
 RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.lock.txt
 
 COPY app ./app
+COPY scripts ./scripts
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
     && useradd --create-home --uid 1000 mcu \

@@ -41,6 +41,8 @@ export MCU_PASSWORD='dev-pass-123' MCU_SECURE_COOKIES=0 COZE_MODE=mock
 
 ## 真实模式（联调才用）
 
+令牌使用扣子 **SAT**（用户已调整权限，需开通 `chat` 与 `uploadFile`）。
+
 ```bash
 export COZE_MODE=real
 export COZE_BOT_ID=<真实 bot_id>
