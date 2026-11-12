@@ -1,0 +1,16 @@
+.venv/
+.git/
+data/
+uploads/
+secrets/
+tests/
+archive/
+docs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.local/
+.env
+*.token
+*.pat
+run.log

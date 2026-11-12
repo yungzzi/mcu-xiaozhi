@@ -163,3 +163,15 @@ def test_root_path_urls(tmp_path):
         assert "/mcu-xiaozhi/static/style.css" in r.text
         r = login(c)
         assert "Path=/mcu-xiaozhi" in r.headers["set-cookie"]
+        # 重定向 Location 必须带反代前缀
+        assert r.headers["location"] == "/mcu-xiaozhi/chat"
+        # TestClient 用裸路径模拟「反代剥前缀」；浏览器实际都在前缀下，
+        # 故把 Cookie 改挂到 / 以便裸路径请求也能携带。
+        token = c.cookies.get(COOKIE_NAME)
+        c.cookies.set(COOKIE_NAME, token, path="/")
+        r = c.get("/", follow_redirects=False)
+        assert r.headers["location"] == "/mcu-xiaozhi/chat"
+        r = c.post("/logout", follow_redirects=False)
+        assert r.headers["location"] == "/mcu-xiaozhi/login"
+        r = c.get("/chat", follow_redirects=False)
+        assert r.headers["location"] == "/mcu-xiaozhi/login"
