@@ -66,3 +66,55 @@ button.linklike {
   font-size: 0.9rem;
 }
 .login-card { max-width: 420px; margin: 8vh auto 0; }
+
+/* 聊天布局 */
+.topnav { display: flex; align-items: center; gap: 12px; }
+.topnav a { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+.chat-wrap { display: flex; flex-direction: column; height: calc(100vh - 60px); }
+.conv-bar { display: flex; gap: 8px; margin-bottom: 8px; }
+.conv-bar select {
+  flex: 1; padding: 8px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--card); font-size: 0.9rem;
+}
+.conv-bar button { margin: 0; padding: 8px 12px; font-size: 0.9rem; }
+.messages {
+  flex: 1; overflow-y: auto; padding: 8px 4px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.msg { display: flex; }
+.msg.user { justify-content: flex-end; }
+.msg .body {
+  max-width: 85%; padding: 10px 12px; border-radius: 12px;
+  font-size: 0.95rem; line-height: 1.55; word-break: break-word;
+  white-space: pre-wrap;
+}
+.msg.user .body { background: var(--accent); color: #fff; }
+.msg.assistant .body { background: var(--card); border: 1px solid var(--border); white-space: normal; }
+.msg.assistant .body.streaming { white-space: pre-wrap; }
+pre.code {
+  background: #f3f4f6; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px; overflow-x: auto; font-size: 0.85rem; white-space: pre;
+}
+code.inline { background: #f3f4f6; border-radius: 4px; padding: 1px 5px; font-size: 0.85em; }
+.plugin-img, .attachment-thumb { max-width: 100%; border-radius: 8px; display: block; margin: 6px 0; }
+.attachment-thumb { max-height: 160px; }
+.status-tag { color: var(--error); font-size: 0.8rem; margin-top: 6px; }
+.banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: #fef2f2; border: 1px solid #fecaca; color: var(--error);
+  border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 0.85rem;
+}
+.banner button { margin: 0; padding: 6px 10px; font-size: 0.8rem; background: var(--error); }
+.composer { display: flex; gap: 8px; padding: 8px 0; }
+.composer textarea {
+  flex: 1; resize: none; padding: 10px; font-size: 1rem;
+  border: 1px solid var(--border); border-radius: 8px; font-family: inherit;
+}
+.composer button { margin: 0; }
+.conv-list { list-style: none; padding: 0; margin: 0; }
+.conv-list li {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 4px; border-bottom: 1px solid var(--border);
+}
+.conv-list a { color: var(--text); text-decoration: none; flex: 1; }
+.del-conv { color: var(--error) !important; }

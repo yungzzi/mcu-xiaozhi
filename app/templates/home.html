@@ -1,14 +1,18 @@
 {% extends "base.html" %}
 {% block title %}MCU 小智{% endblock %}
 {% block topbar_right %}
-<form method="post" action="{{ url_for('logout') }}">
-  <button class="linklike" type="submit">退出登录</button>
-</form>
+<nav class="topnav">
+  <a href="{{ url_for('chat_page') }}">聊天</a>
+  <form method="post" action="{{ url_for('logout') }}">
+    <button class="linklike" type="submit">退出登录</button>
+  </form>
+</nav>
 {% endblock %}
 {% block content %}
 <div class="card">
   <h1>账号</h1>
   <p class="hint">当前为师生共享账号。共享密码的轮换由部署管理员在服务器上执行
   （scripts/rotate_password.py），轮换后所有设备的旧登录都会失效。</p>
+  <p class="hint"><a href="{{ url_for('chat_page') }}">进入聊天</a></p>
 </div>
 {% endblock %}

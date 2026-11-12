@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}历史 · MCU 小智{% endblock %}
+{% block topbar_right %}
+<nav class="topnav">
+  <a href="{{ url_for('chat_page') }}">聊天</a>
+  <form method="post" action="{{ url_for('logout') }}">
+    <button class="linklike" type="submit">退出</button>
+  </form>
+</nav>
+{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>聊天历史</h1>
+  <p class="hint">仅显示当前登录会话的历史。重新登录会开启新的历史。</p>
+  {% if not convs %}<p class="hint">还没有聊天记录。</p>{% endif %}
+  <ul class="conv-list">
+    {% for c in convs %}
+    <li>
+      <a href="{{ url_for('chat_page') }}?cid={{ c.id }}">{{ c.title }}</a>
+      <button class="linklike del-conv" data-id="{{ c.id }}" type="button">删除</button>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.querySelectorAll('.del-conv').forEach(function (btn) {
+  btn.addEventListener('click', async function () {
+    if (!confirm('删除这条聊天记录？')) return;
+    const r = await fetch('api/conversations/' + btn.dataset.id, { method: 'DELETE' });
+    if (r.ok) location.reload();
+  });
+});
+</script>
+{% endblock %}

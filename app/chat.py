@@ -1,0 +1,232 @@
+"""聊天路由：会话管理 + SSE 流式回复。
+
+- 每个站内登录会话只能访问自己的 conversations/messages/attachments（逐次校验）。
+- 一个聊天同时只允许一轮生成（进程内 asyncio.Lock，单容器部署）。
+- 增量事件只用于更新网页；入库以最终回复为准，避免重复拼接。
+- 中断/失败时保存已收到的部分文本并标记 status，用户可看历史并自行重发。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+
+from fastapi import Request
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+
+from .auth import COOKIE_NAME
+from .coze import ChatRequest, CozeError
+from .db import now
+
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def register_chat_routes(app):
+    db = app.state.db
+    auth = app.state.auth
+    settings = app.state.settings
+    templates = app.state.templates
+    client = app.state.coze
+    locks: dict[int, asyncio.Lock] = {}
+    app.state.chat_locks = locks
+
+    def session_of(request: Request):
+        return auth.get_session(request.cookies.get(COOKIE_NAME))
+
+    def unauthorized():
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    def owned_conv(session, cid: int):
+        return db.query_one(
+            "SELECT * FROM conversations WHERE id=? AND token_hash=?", (cid, session["token_hash"])
+        )
+
+    @app.get("/chat", name="chat_page")
+    def chat_page(request: Request):
+        session = session_of(request)
+        if session is None:
+            return RedirectResponse(app.url_path_for("login_page"), status_code=303)
+        return templates.TemplateResponse(request, "chat.html", {})
+
+    @app.get("/history", name="history_page")
+    def history_page(request: Request):
+        session = session_of(request)
+        if session is None:
+            return RedirectResponse(app.url_path_for("login_page"), status_code=303)
+        convs = db.query(
+            "SELECT id, title, updated_at FROM conversations WHERE token_hash=? ORDER BY updated_at DESC",
+            (session["token_hash"],),
+        )
+        return templates.TemplateResponse(request, "history.html", {"convs": convs})
+
+    @app.get("/api/conversations")
+    def list_conversations(request: Request):
+        session = session_of(request)
+        if session is None:
+            return unauthorized()
+        rows = db.query(
+            "SELECT id, title, created_at, updated_at FROM conversations WHERE token_hash=? ORDER BY updated_at DESC",
+            (session["token_hash"],),
+        )
+        return [dict(r) for r in rows]
+
+    @app.post("/api/conversations")
+    def create_conversation(request: Request):
+        session = session_of(request)
+        if session is None:
+            return unauthorized()
+        t = now()
+        cur = db.execute(
+            "INSERT INTO conversations(token_hash, title, created_at, updated_at) VALUES(?,?,?,?)",
+            (session["token_hash"], "新对话", t, t),
+        )
+        return {"id": cur.lastrowid, "title": "新对话"}
+
+    @app.get("/api/conversations/{cid}/messages")
+    def get_messages(request: Request, cid: int):
+        session = session_of(request)
+        if session is None:
+            return unauthorized()
+        if owned_conv(session, cid) is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        rows = db.query(
+            "SELECT id, role, content, status, created_at FROM messages WHERE conversation_id=? ORDER BY id",
+            (cid,),
+        )
+        msgs = [dict(r) for r in rows]
+        for m in msgs:
+            atts = db.query(
+                "SELECT id, orig_name, mime FROM attachments WHERE message_id=?", (m["id"],)
+            )
+            m["attachments"] = [dict(a) for a in atts]
+        return {"messages": msgs}
+
+    @app.delete("/api/conversations/{cid}")
+    def delete_conversation(request: Request, cid: int):
+        session = session_of(request)
+        if session is None:
+            return unauthorized()
+        if owned_conv(session, cid) is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        db.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)", (cid,))
+        db.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
+        db.execute("DELETE FROM conversations WHERE id=?", (cid,))
+        return {"ok": True}
+
+    @app.post("/api/conversations/{cid}/send")
+    async def send_message(request: Request, cid: int):
+        session = session_of(request)
+        if session is None:
+            return unauthorized()
+        conv = owned_conv(session, cid)
+        if conv is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "bad_json"}, status_code=400)
+        text = (body.get("text") or "").strip()
+        attachment_ids = body.get("attachment_ids") or []
+        if not text and not attachment_ids:
+            return JSONResponse({"error": "empty"}, status_code=400)
+
+        lock = locks.setdefault(cid, asyncio.Lock())
+        if lock.locked():
+            return JSONResponse({"error": "busy", "message": "当前聊天正在生成回复，请稍候"}, status_code=409)
+        await lock.acquire()
+
+        # 校验附件归属（附件功能在分支3启用，这里先做归属检查）
+        file_ids = []
+        att_rows = []
+        for aid in attachment_ids:
+            att = db.query_one(
+                "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
+            )
+            if att is None:
+                lock.release()
+                return JSONResponse({"error": "attachment_not_found"}, status_code=404)
+            att_rows.append(att)
+            if att["coze_file_id"]:
+                file_ids.append(att["coze_file_id"])
+
+        user_cur = db.execute(
+            "INSERT INTO messages(conversation_id, role, content, status, created_at) VALUES(?,?,?,?,?)",
+            (cid, "user", text, "ok", now()),
+        )
+        user_msg_id = user_cur.lastrowid
+        for att in att_rows:
+            db.execute("UPDATE attachments SET message_id=? WHERE id=?", (user_msg_id, att["id"]))
+        if conv["title"] == "新对话" and text:
+            db.execute("UPDATE conversations SET title=? WHERE id=?", (text[:30], cid))
+        db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
+
+        coze_conv_id = conv["coze_conversation_id"]
+        token_hash = session["token_hash"]
+        coze_user_id = session["coze_user_id"]
+
+        def save_assistant(content: str, status: str) -> int:
+            cur = db.execute(
+                "INSERT INTO messages(conversation_id, role, content, status, created_at) VALUES(?,?,?,?,?)",
+                (cid, "assistant", content, status, now()),
+            )
+            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
+            return cur.lastrowid
+
+        async def gen():
+            acc: list[str] = []
+            content = None
+            err = None
+            nonlocal coze_conv_id
+            try:
+                async for ev in client.stream_chat(
+                    ChatRequest(
+                        user_id=coze_user_id,
+                        conversation_id=coze_conv_id,
+                        text=text,
+                        file_ids=file_ids or None,
+                    )
+                ):
+                    if ev["type"] == "meta":
+                        if not coze_conv_id:
+                            coze_conv_id = ev["conversation_id"]
+                            db.execute(
+                                "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND token_hash=?",
+                                (coze_conv_id, cid, token_hash),
+                            )
+                        yield sse("meta", {"conversation_id": coze_conv_id})
+                    elif ev["type"] == "delta":
+                        acc.append(ev["text"])
+                        yield sse("delta", {"text": ev["text"]})
+                    elif ev["type"] == "done":
+                        content = ev["content"]
+                if content is None:
+                    content = "".join(acc)
+            except CozeError as exc:
+                content = "".join(acc)
+                err = {"kind": exc.kind, "message": exc.message, "code": exc.code}
+                save_assistant(content, exc.kind)
+                yield sse("error", err)
+                return
+            except (asyncio.CancelledError, GeneratorExit):
+                save_assistant("".join(acc), "interrupted")
+                raise
+            except Exception:
+                # 未知错误：不向浏览器暴露内部细节，保留脱敏日志
+                import logging
+
+                logging.getLogger("mcu.chat").exception("stream failed conv=%s", cid)
+                content = "".join(acc)
+                save_assistant(content, "other")
+                yield sse("error", {"kind": "other", "message": "回复生成失败，可查看历史后重发"})
+                return
+            finally:
+                lock.release()
+            msg_id = save_assistant(content, "ok")
+            yield sse("done", {"message_id": msg_id, "content": content, "status": "ok"})
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
