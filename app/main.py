@@ -101,29 +101,4 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return login_redirect()
         return templates.TemplateResponse(request, "home.html", {"session": session})
 
-    @app.post("/settings/password")
-    def change_password(
-        request: Request,
-        current: str = Form(...),
-        new: str = Form(...),
-    ):
-        session = current_session(request)
-        if session is None:
-            return login_redirect()
-        try:
-            ok = auth.change_password(settings.username, current, new)
-        except ValueError as exc:
-            return templates.TemplateResponse(
-                request, "home.html", {"session": session, "msg": str(exc)}, status_code=400
-            )
-        if not ok:
-            return templates.TemplateResponse(
-                request, "home.html", {"session": session, "msg": "当前密码不正确"}, status_code=401
-            )
-        resp = RedirectResponse(
-            app.url_path_for("login_page") + "?msg=" + "密码已更新，请重新登录", status_code=303
-        )
-        resp.delete_cookie(COOKIE_NAME, path=settings.root_path or "/")
-        return resp
-
     return app

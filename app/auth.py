@@ -103,14 +103,22 @@ class AuthService:
     def revoke(self, token: str) -> None:
         self.db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(token),))
 
-    def change_password(self, username: str, current: str, new: str) -> bool:
-        if not self.check_login(username, current):
-            return False
+    def rotate_password(self, username: str, new: str) -> int:
+        """运维操作：轮换共享密码并撤销全部旧登录。
+
+        仅供部署管理员通过 scripts/rotate_password.py 在服务器上执行，
+        不暴露任何站内 HTTP 接口（共享账号的普通登录会话无权改密）。
+        返回被撤销的会话数。
+        """
         if len(new) < 8:
             raise ValueError("新密码至少 8 位")
+        user = self.db.query_one("SELECT id FROM users WHERE username=?", (username,))
+        if user is None:
+            raise ValueError(f"用户不存在：{username}")
+        revoked = len(self.db.query("SELECT token_hash FROM sessions"))
         self.db.execute(
             "UPDATE users SET password_hash=?, password_version=password_version+1 WHERE username=?",
             (hash_password(new), username),
         )
         self.db.execute("DELETE FROM sessions")  # 撤销全部旧登录
-        return True
+        return revoked

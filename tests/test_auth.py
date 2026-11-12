@@ -70,41 +70,67 @@ def test_two_logins_have_distinct_coze_user_ids(app):
         assert all(i.startswith("mcu-") for i in ids)
 
 
-def test_password_change_revokes_all_sessions(app):
+def test_rotate_password_revokes_all_sessions(app):
     with TestClient(app) as c1, TestClient(app) as c2:
         login(c1)
         login(c2)
-        r = c1.post(
-            "/settings/password",
-            data={"current": PASSWORD, "new": "new-pass-456"},
-            follow_redirects=False,
-        )
-        assert r.status_code == 303
+        revoked = app.state.auth.rotate_password("mcu", "new-pass-456")
+        assert revoked == 2
         assert c1.get("/home", follow_redirects=False).status_code == 303
         assert c2.get("/home", follow_redirects=False).status_code == 303
         assert login(c1, password=PASSWORD).status_code == 401
         assert login(c1, password="new-pass-456").status_code == 303
 
 
-def test_password_change_wrong_current(app, client):
+def test_no_self_service_password_endpoint(app, client):
+    """共享账号的普通登录会话不得拥有改密接口（P1 审阅修复）。"""
     login(client)
     r = client.post(
         "/settings/password",
-        data={"current": "bad", "new": "new-pass-456"},
+        data={"current": PASSWORD, "new": "new-pass-456"},
         follow_redirects=False,
     )
-    assert r.status_code == 401
+    assert r.status_code in (404, 405)
+    # 密码未被改动，会话仍有效
     assert client.get("/home", follow_redirects=False).status_code == 200
+    assert login(client, password=PASSWORD).status_code == 303
 
 
-def test_password_change_too_short(app, client):
-    login(client)
-    r = client.post(
-        "/settings/password",
-        data={"current": PASSWORD, "new": "short"},
-        follow_redirects=False,
-    )
-    assert r.status_code == 400
+def test_rotate_password_too_short(app):
+    try:
+        app.state.auth.rotate_password("mcu", "short")
+        raise AssertionError("应当拒绝过短密码")
+    except ValueError:
+        pass
+
+
+def test_rotate_password_script(app, tmp_path):
+    """运维脚本端到端：--password-file 轮换后旧会话失效、新密码可登录。"""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    with TestClient(app) as c:
+        login(c)
+        pw_file = tmp_path / "new-pw.txt"
+        pw_file.write_text("script-pass-789", encoding="utf-8")
+        repo = Path(__file__).resolve().parents[1]
+        env = {
+            "MCU_DATA_DIR": str(app.state.settings.data_dir),
+            "MCU_UPLOAD_DIR": str(app.state.settings.upload_dir),
+            "MCU_USERNAME": "mcu",
+            "MCU_PASSWORD": PASSWORD,
+            "PATH": "/usr/bin:/bin",
+        }
+        r = subprocess.run(
+            [sys.executable, str(repo / "scripts" / "rotate_password.py"),
+             "--password-file", str(pw_file)],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert r.returncode == 0, r.stderr
+        assert "撤销 1 个旧登录会话" in r.stdout
+        assert c.get("/home", follow_redirects=False).status_code == 303
+        assert login(c, password="script-pass-789").status_code == 303
 
 
 def test_first_boot_requires_password(tmp_path):
