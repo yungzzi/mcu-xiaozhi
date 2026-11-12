@@ -20,7 +20,10 @@
     <span id="banner-text"></span>
     <button id="resend" type="button">重发上一条</button>
   </div>
+  <div id="pending" class="pending" hidden></div>
   <form id="composer" class="composer">
+    <input id="file-input" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" hidden>
+    <button id="attach" type="button" title="上传图片（JPG/PNG）">图片</button>
     <textarea id="input" rows="2" placeholder="输入问题…（Enter 发送，Shift+Enter 换行）"></textarea>
     <button id="send" type="submit">发送</button>
   </form>
