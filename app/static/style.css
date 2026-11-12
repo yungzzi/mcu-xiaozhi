@@ -111,6 +111,14 @@ code.inline { background: #f3f4f6; border-radius: 4px; padding: 1px 5px; font-si
   border: 1px solid var(--border); border-radius: 8px; font-family: inherit;
 }
 .composer button { margin: 0; }
+.composer #attach { background: var(--card); color: var(--accent); border: 1px solid var(--border); }
+.pending { display: flex; gap: 8px; flex-wrap: wrap; padding: 4px 0; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 4px; background: var(--card);
+}
+.chip img { max-height: 48px; max-width: 64px; border-radius: 4px; }
+.chip button { margin: 0; padding: 2px 6px; background: var(--error); font-size: 0.8rem; }
 .conv-list { list-style: none; padding: 0; margin: 0; }
 .conv-list li {
   display: flex; justify-content: space-between; align-items: center;

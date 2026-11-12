@@ -13,6 +13,7 @@ from .chat import register_chat_routes
 from .config import Settings
 from .coze import get_client
 from .db import Database
+from .uploads import register_upload_routes
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -37,6 +38,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     register_chat_routes(app)
+    register_upload_routes(app)
 
     def current_session(request: Request):
         return auth.get_session(request.cookies.get(COOKIE_NAME))

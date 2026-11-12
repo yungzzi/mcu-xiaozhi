@@ -14,6 +14,51 @@
   var convId = null;
   var busy = false;
   var lastUserText = '';
+  var lastAttachmentIds = [];
+  var pending = [];  // 已上传待发送的附件 {id, orig_name}
+  var pendingEl = document.getElementById('pending');
+  var fileInput = document.getElementById('file-input');
+
+  function renderPending() {
+    pendingEl.innerHTML = '';
+    pendingEl.hidden = pending.length === 0;
+    pending.forEach(function (a) {
+      var chip = document.createElement('span');
+      chip.className = 'chip';
+      var img = document.createElement('img');
+      img.src = 'api/attachments/' + a.id;
+      img.alt = a.orig_name;
+      chip.appendChild(img);
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = '×';
+      rm.addEventListener('click', function () {
+        pending = pending.filter(function (x) { return x.id !== a.id; });
+        renderPending();
+      });
+      chip.appendChild(rm);
+      pendingEl.appendChild(chip);
+    });
+  }
+  document.getElementById('attach').addEventListener('click', function () {
+    fileInput.click();
+  });
+  fileInput.addEventListener('change', async function () {
+    var f = fileInput.files[0];
+    fileInput.value = '';
+    if (!f) return;
+    var fd = new FormData();
+    fd.append('file', f);
+    var r = await fetch('api/uploads', { method: 'POST', body: fd });
+    if (!r.ok) {
+      var err = await r.json().catch(function () { return {}; });
+      showBanner('other', err.message || '图片上传失败（' + r.status + '）');
+      return;
+    }
+    var a = await r.json();
+    pending.push(a);
+    renderPending();
+  });
 
   /* ---------- 安全 Markdown：纯 DOM 构造，不使用 innerHTML ----------
    * 文本一律经 textContent 写入；URL 只有通过 safeUrl 校验后才赋给 img.src / a.href，
@@ -185,12 +230,21 @@
     sendBtn.disabled = v;
     sendBtn.textContent = v ? '生成中…' : '发送';
   }
-  async function send(text) {
-    if (busy || !convId || !text.trim()) return;
+  async function send(text, attachmentIds) {
+    attachmentIds = attachmentIds || [];
+    if (busy || !convId || (!text.trim() && attachmentIds.length === 0)) return;
     hideBanner();
     lastUserText = text;
+    lastAttachmentIds = attachmentIds;
     var userBody = bubble('user');
     userBody.textContent = text;
+    attachmentIds.forEach(function (id) {
+      var img = document.createElement('img');
+      img.className = 'attachment-thumb';
+      img.src = 'api/attachments/' + id;
+      img.loading = 'lazy';
+      userBody.appendChild(img);
+    });
     var liveBody = bubble('assistant');
     liveBody.classList.add('streaming');
     setBusy(true);
@@ -200,7 +254,7 @@
       var resp = await fetch('api/conversations/' + convId + '/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: text })
+        body: JSON.stringify({ text: text, attachment_ids: attachmentIds })
       });
       if (resp.status === 409) {
         liveBody.parentElement.remove();
@@ -287,8 +341,11 @@
   composer.addEventListener('submit', function (e) {
     e.preventDefault();
     var text = inputEl.value;
+    var ids = pending.map(function (a) { return a.id; });
     inputEl.value = '';
-    send(text);
+    pending = [];
+    renderPending();
+    send(text, ids);
   });
   inputEl.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -306,7 +363,7 @@
   });
   resendBtn.addEventListener('click', function () {
     hideBanner();
-    if (lastUserText) send(lastUserText);
+    if (lastUserText || lastAttachmentIds.length) send(lastUserText, lastAttachmentIds);
   });
 
   var params = new URLSearchParams(location.search);

@@ -27,6 +27,8 @@ class MockCozeClient:
 
     async def upload_file(self, filename: str, data: bytes, mime: str) -> str:
         await asyncio.sleep(0)
+        if "fail-upload" in filename:
+            raise CozeError("network", "模拟：上传失败", code="mock-upload")
         file_id = "mock-file-" + secrets.token_hex(6)
         self.uploads.append({"file_id": file_id, "filename": filename, "size": len(data), "mime": mime})
         return file_id
