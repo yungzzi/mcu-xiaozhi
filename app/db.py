@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     token_hash TEXT NOT NULL,
     user_id INTEGER,
     coze_conversation_id TEXT,
+    coze_user_id TEXT,
+    context_restore INTEGER NOT NULL DEFAULT 0,
+    legacy_coze_conversation_id TEXT,
     title TEXT NOT NULL DEFAULT '新对话',
     auto_title INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
@@ -75,6 +78,9 @@ class Database:
             # 幂等迁移：旧库补 auto_title 列（是否允许首问自动命名；
             # 手动重命名后置 0，避免同名默认标题被首问覆盖，审阅 P2）
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
+            # 谱系判定：迁移前已有 user_id 列 → 0.2.x 账号级版本。
+            # 该版本创建的扣子上下文一律用账号级身份，创建者登录被删也不需重建。
+            had_account_migration = "user_id" in cols
             if "auto_title" not in cols:
                 # 补列与回填必须在同一事务内（审阅迁移 P2）：sqlite3 默认
                 # 隔离级别下 ALTER TABLE 会立即自动提交，若两者之间中断，
@@ -95,9 +101,8 @@ class Database:
                         self._conn.execute("ROLLBACK")
                     raise
             # 幂等迁移：历史归属从登录会话改为账号（跨设备共享历史）。
-            # 单共享账号应用：全部旧数据归属该账号；附件记录相对存储路径；
-            # 旧聊天的扣子上下文绑在旧的按会话 coze_user_id 上，账号级切换后
-            # 重置以避免追问失败（站点历史完整保留）。与补列同一事务。
+            # 单共享账号应用：全部旧数据归属该账号；附件记录相对存储路径。
+            # 扣子上下文的保留/找回在下一个迁移块处理。与补列同一事务。
             conv_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
             att_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(attachments)")}
             if "user_id" not in conv_cols or "user_id" not in att_cols or "stored_path" not in att_cols:
@@ -121,7 +126,44 @@ class Database:
                         "UPDATE attachments SET stored_path=substr(token_hash,1,16) || '/' || stored_name"
                         " WHERE stored_path IS NULL"
                     )
-                    self._conn.execute("UPDATE conversations SET coze_conversation_id=NULL")
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
+            # 幂等迁移：扣子上下文跟聊天走（审阅调整）。每条聊天保存调用扣子
+            # 使用的 coze_user_id；在 sessions 归一化之前（AuthService 在本迁移
+            # 之后初始化），用旧聊天的 token_hash 找回旧登录的扣子身份：
+            # - 可找回：保留旧 (coze_user_id, coze_conversation_id) 对，续用原会话
+            # - 找不回（旧登录已退出/过期/改密删除）：旧会话 ID 存入 legacy 作迁移
+            #   记录，标记 context_restore，首次续问用近期问答重建上下文
+            conv_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
+            if ("coze_user_id" not in conv_cols or "context_restore" not in conv_cols
+                    or "legacy_coze_conversation_id" not in conv_cols):
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    if "coze_user_id" not in conv_cols:
+                        self._conn.execute("ALTER TABLE conversations ADD COLUMN coze_user_id TEXT")
+                    if "context_restore" not in conv_cols:
+                        self._conn.execute(
+                            "ALTER TABLE conversations ADD COLUMN context_restore INTEGER NOT NULL DEFAULT 0")
+                    if "legacy_coze_conversation_id" not in conv_cols:
+                        self._conn.execute(
+                            "ALTER TABLE conversations ADD COLUMN legacy_coze_conversation_id TEXT")
+                    self._conn.execute(
+                        "UPDATE conversations SET coze_user_id=("
+                        " SELECT s.coze_user_id FROM sessions s WHERE s.token_hash=conversations.token_hash)"
+                        " WHERE coze_user_id IS NULL AND coze_conversation_id IS NOT NULL"
+                        " AND EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash=conversations.token_hash)"
+                    )
+                    if not had_account_migration:
+                        # 仅 0.1.3 直升级路径：旧身份找不回才标记重建。
+                        # 0.2.x 谱系的上下文本就账号级，coze_user_id 留空回落即可。
+                        self._conn.execute(
+                            "UPDATE conversations SET legacy_coze_conversation_id=coze_conversation_id,"
+                            " coze_conversation_id=NULL, context_restore=1"
+                            " WHERE coze_user_id IS NULL AND coze_conversation_id IS NOT NULL"
+                        )
                     self._conn.execute("COMMIT")
                 except BaseException:
                     if self._conn.in_transaction:

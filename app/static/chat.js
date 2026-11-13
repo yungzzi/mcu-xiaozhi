@@ -253,6 +253,7 @@
       auth: '凭证失效，请联系管理员',
       interrupted: '回复中断',
       action_required: '智能体需要额外操作（如端插件授权），本轮未完成',
+      conversation_invalid: '原扣子会话不可用',
       network: '网络错误',
       other: '生成失败'
     }[kind] || '生成失败';

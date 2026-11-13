@@ -67,6 +67,10 @@ SCENARIOS = {
         ev("error", {"code": 4015, "msg": "quota exceeded"}),
         DONE,
     ],
+    "conv_invalid": [
+        ev("conversation.chat.failed", {"code": 40003, "msg": "conversation not found or no permission"}),
+        DONE,
+    ],
 }
 
 
@@ -192,6 +196,12 @@ def test_chat_failed_direct_format(server):
 
 def test_error_event_quota(server):
     expect_error(make_client(server, "errorevent"), "quota")
+
+
+def test_conversation_invalid_classified(server):
+    """扣子明确判定会话不存在/不可访问 → conversation_invalid（触发重建流程）。"""
+    exc = expect_error(make_client(server, "conv_invalid"), "conversation_invalid")
+    assert exc.code == 40003
 
 
 def test_http_401_auth(server):

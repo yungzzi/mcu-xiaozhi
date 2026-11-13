@@ -21,12 +21,16 @@ _HTTP_KIND = {401: "auth", 403: "auth", 429: "quota"}
 # 待联调核对：业务错误消息关键字 → kind（保留原始 code 供日志/审阅）
 _QUOTA_HINTS = ("quota", "额度", "exceed", "limit", "balance")
 _AUTH_HINTS = ("token", "auth", "unauthorized", "credential", "pat ")
+# 待联调核对：扣子明确判定会话不存在/不可访问 → 进入上下文重建流程
+_CONV_INVALID_HINTS = ("not exist", "not found", "invalid", "no permission", "access denied", "deleted")
 
 
 def classify(code, message: str, http_status: int | None = None) -> str:
     if http_status in _HTTP_KIND:
         return _HTTP_KIND[http_status]
     low = (message or "").lower()
+    if "conversation" in low and any(h in low for h in _CONV_INVALID_HINTS):
+        return "conversation_invalid"
     if any(h in low for h in _QUOTA_HINTS):
         return "quota"
     if any(h in low for h in _AUTH_HINTS):

@@ -26,6 +26,39 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def build_restore_prefix(db, cid: int) -> str:
+    """旧扣子身份找不回时，用近期成功问答重建上下文（审阅调整）。
+
+    只取「成功的问答对」：assistant 必须 status=ok，user 必须有其后的 ok 回答
+    （失败轮次的问题与当前尚未回答的问题都不带入）。按时间顺序拼接，
+    最多 20 条、单条截断 1000 字。仅作为本次 /v3/chat 请求文本的前缀，
+    不入库、不改动站点历史。
+    """
+    rows = db.query(
+        "SELECT role, content, status FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 60",
+        (cid,),
+    )
+    parts: list[str] = []
+    answered = False
+    for r in rows:  # 从最新往回配对
+        if r["role"] == "assistant" and r["status"] == "ok":
+            parts.append("助手：" + r["content"][:1000])
+            answered = True
+        elif r["role"] == "user" and r["status"] == "ok" and answered:
+            parts.append("用户：" + r["content"][:1000])
+            answered = False
+        if len(parts) >= 20:
+            break
+    if not parts:
+        return ""
+    parts.reverse()
+    return (
+        "【以下是本聊天此前的对话记录（节选），用于恢复上下文，请勿重复回答】\n"
+        + "\n".join(parts)
+        + "\n【对话记录结束，请回答最新问题】\n"
+    )
+
+
 class _LockGuard:
     """幂等释放 holders：endpoint 建立阶段、生成器、响应生命周期共用同一个 guard。
 
@@ -125,8 +158,9 @@ def register_chat_routes(app):
             return unauthorized()
         t = now()
         cur = db.execute(
-            "INSERT INTO conversations(token_hash, user_id, title, created_at, updated_at) VALUES(?,?,?,?,?)",
-            (session["token_hash"], session["user_id"], "新对话", t, t),
+            "INSERT INTO conversations(token_hash, user_id, coze_user_id, title, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (session["token_hash"], session["user_id"], session["coze_user_id"], "新对话", t, t),
         )
         return {"id": cur.lastrowid, "title": "新对话"}
 
@@ -302,8 +336,16 @@ def register_chat_routes(app):
 
         coze_conv_id = conv["coze_conversation_id"]
         user_id = session["user_id"]
-        coze_user_id = session["coze_user_id"]
+        # 扣子上下文跟聊天走：用该聊天保存的 ID 对；新聊天/找不回旧身份的聊天
+        # 回落到账号级标识（审阅调整）
+        coze_user_id = conv["coze_user_id"] or session["coze_user_id"]
         conv_created = conv["created_at"]
+        restore = bool(conv["context_restore"])
+        send_text = text
+        if restore:
+            prefix = build_restore_prefix(db, cid)
+            if prefix:
+                send_text = prefix + "\n" + text
 
         def conv_alive() -> bool:
             # 写入时校验：会话仍存在、归属一致、且是本轮开始时的同一会话
@@ -335,7 +377,7 @@ def register_chat_routes(app):
                 ChatRequest(
                     user_id=coze_user_id,
                     conversation_id=coze_conv_id,
-                    text=text,
+                    text=send_text,
                     file_ids=file_ids or None,
                 )
             )
@@ -344,10 +386,12 @@ def register_chat_routes(app):
                     if ev["type"] == "meta":
                         if not coze_conv_id:
                             coze_conv_id = ev["conversation_id"]
-                            db.execute(
-                                "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND user_id=? AND created_at=?",
-                                (coze_conv_id, cid, user_id, conv_created),
-                            )
+                            # 恢复模式：整轮成功后才切换映射（失败则下次仍带历史）
+                            if not restore:
+                                db.execute(
+                                    "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND user_id=? AND created_at=?",
+                                    (coze_conv_id, cid, user_id, conv_created),
+                                )
                         yield sse("meta", {"conversation_id": coze_conv_id})
                     elif ev["type"] == "delta":
                         acc.append(ev["text"])
@@ -358,12 +402,30 @@ def register_chat_routes(app):
                     content = "".join(acc)
                 msg_id = save_assistant(content, "ok")
                 saved = True
+                if restore and msg_id != -1 and coze_conv_id:
+                    # 整轮成功：切换到新会话映射，之后只发新问题
+                    db.execute(
+                        "UPDATE conversations SET coze_conversation_id=?, coze_user_id=?, context_restore=0"
+                        " WHERE id=? AND user_id=? AND created_at=?",
+                        (coze_conv_id, coze_user_id, cid, user_id, conv_created),
+                    )
                 yield sse("done", {"message_id": msg_id, "content": content, "status": "ok"})
             except CozeError as exc:
                 content = "".join(acc)
                 if not saved:
                     save_assistant(content, exc.kind)
-                yield sse("error", {"kind": exc.kind, "message": exc.message, "code": exc.code})
+                message = exc.message
+                if exc.kind == "conversation_invalid" and not restore and coze_conv_id:
+                    # 扣子明确判定旧会话不存在/不可访问：旧 ID 留作记录，
+                    # 下次发送自动带近期历史重建（4028/超时/断线不走这里，保留旧映射）
+                    db.execute(
+                        "UPDATE conversations SET legacy_coze_conversation_id=coze_conversation_id,"
+                        " coze_conversation_id=NULL, coze_user_id=NULL, context_restore=1"
+                        " WHERE id=? AND user_id=? AND created_at=?",
+                        (cid, user_id, conv_created),
+                    )
+                    message = "原扣子会话不可用，下次发送将自动带上近期历史重建上下文"
+                yield sse("error", {"kind": exc.kind, "message": message, "code": exc.code})
             except (asyncio.CancelledError, GeneratorExit):
                 if not saved:
                     save_assistant("".join(acc), "interrupted")

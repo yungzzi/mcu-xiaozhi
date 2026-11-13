@@ -6,7 +6,7 @@
   {"type": "done",  "content": str}                # 最终完整回复（入库以此为准）
 
 错误统一抛 CozeError，kind 用于前端区分提示：
-  quota | auth | interrupted | network | other
+  quota | auth | interrupted | network | action_required | conversation_invalid | other
 """
 from __future__ import annotations
 
