@@ -83,8 +83,9 @@ def register_chat_routes(app):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     def owned_conv(session, cid: int):
+        # 账号级归属：同一共享账号的所有设备/登录会话共享历史（跨设备需求）
         return db.query_one(
-            "SELECT * FROM conversations WHERE id=? AND token_hash=?", (cid, session["token_hash"])
+            "SELECT * FROM conversations WHERE id=? AND user_id=?", (cid, session["user_id"])
         )
 
     @app.get("/chat", name="chat_page")
@@ -101,8 +102,8 @@ def register_chat_routes(app):
         if session is None:
             return login_redirect()
         convs = db.query(
-            "SELECT id, title, updated_at FROM conversations WHERE token_hash=? ORDER BY updated_at DESC",
-            (session["token_hash"],),
+            "SELECT id, title, updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC",
+            (session["user_id"],),
         )
         return templates.TemplateResponse(request, "history.html", {"convs": convs})
 
@@ -112,8 +113,8 @@ def register_chat_routes(app):
         if session is None:
             return unauthorized()
         rows = db.query(
-            "SELECT id, title, created_at, updated_at FROM conversations WHERE token_hash=? ORDER BY updated_at DESC",
-            (session["token_hash"],),
+            "SELECT id, title, created_at, updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC",
+            (session["user_id"],),
         )
         return [dict(r) for r in rows]
 
@@ -124,8 +125,8 @@ def register_chat_routes(app):
             return unauthorized()
         t = now()
         cur = db.execute(
-            "INSERT INTO conversations(token_hash, title, created_at, updated_at) VALUES(?,?,?,?)",
-            (session["token_hash"], "新对话", t, t),
+            "INSERT INTO conversations(token_hash, user_id, title, created_at, updated_at) VALUES(?,?,?,?,?)",
+            (session["token_hash"], session["user_id"], "新对话", t, t),
         )
         return {"id": cur.lastrowid, "title": "新对话"}
 
@@ -165,7 +166,7 @@ def register_chat_routes(app):
         try:
             db.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)", (cid,))
             db.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
-            db.execute("DELETE FROM conversations WHERE id=? AND token_hash=?", (cid, session["token_hash"]))
+            db.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (cid, session["user_id"]))
         finally:
             lock.release()
         return {"ok": True}
@@ -202,8 +203,8 @@ def register_chat_routes(app):
                 return JSONResponse({"error": "not_found"}, status_code=404)
             cur = db.execute(
                 "UPDATE conversations SET title=?, auto_title=0"
-                " WHERE id=? AND token_hash=? AND created_at=?",
-                (title, cid, session["token_hash"], conv["created_at"]),
+                " WHERE id=? AND user_id=? AND created_at=?",
+                (title, cid, session["user_id"], conv["created_at"]),
             )
             if cur.rowcount == 0:
                 return JSONResponse({"error": "not_found"}, status_code=404)
@@ -259,7 +260,7 @@ def register_chat_routes(app):
             link_ids = []  # 将关联到新消息的附件行 id
             for aid in attachment_ids:
                 att = db.query_one(
-                    "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
+                    "SELECT * FROM attachments WHERE id=? AND user_id=?", (aid, session["user_id"])
                 )
                 if att is None:
                     guard.release()
@@ -270,10 +271,10 @@ def register_chat_routes(app):
                     # 重发：复制一条新索引行（共用磁盘文件与 coze_file_id），
                     # 不改动旧消息与附件的关联（审阅 P2 修复）
                     copy_cur = db.execute(
-                        "INSERT INTO attachments(token_hash, orig_name, stored_name, mime, size, coze_file_id, created_at)"
-                        " VALUES(?,?,?,?,?,?,?)",
-                        (session["token_hash"], att["orig_name"], att["stored_name"],
-                         att["mime"], att["size"], att["coze_file_id"], now()),
+                        "INSERT INTO attachments(token_hash, user_id, orig_name, stored_name, stored_path, mime, size, coze_file_id, created_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?)",
+                        (session["token_hash"], session["user_id"], att["orig_name"], att["stored_name"],
+                         att["stored_path"], att["mime"], att["size"], att["coze_file_id"], now()),
                     )
                     link_ids.append(copy_cur.lastrowid)
                 if att["coze_file_id"]:
@@ -291,8 +292,8 @@ def register_chat_routes(app):
             if conv["auto_title"] and text:
                 db.execute(
                     "UPDATE conversations SET title=?, auto_title=0"
-                    " WHERE id=? AND token_hash=? AND created_at=?",
-                    (text[:30], cid, session["token_hash"], conv["created_at"]),
+                    " WHERE id=? AND user_id=? AND created_at=?",
+                    (text[:30], cid, session["user_id"], conv["created_at"]),
                 )
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
         except Exception:
@@ -300,7 +301,7 @@ def register_chat_routes(app):
             raise
 
         coze_conv_id = conv["coze_conversation_id"]
-        token_hash = session["token_hash"]
+        user_id = session["user_id"]
         coze_user_id = session["coze_user_id"]
         conv_created = conv["created_at"]
 
@@ -308,8 +309,8 @@ def register_chat_routes(app):
             # 写入时校验：会话仍存在、归属一致、且是本轮开始时的同一会话
             # （created_at 防止 SQLite 复用已删除整数 ID 后误写新会话，审阅二轮 P1）
             return db.query_one(
-                "SELECT id FROM conversations WHERE id=? AND token_hash=? AND created_at=?",
-                (cid, token_hash, conv_created),
+                "SELECT id FROM conversations WHERE id=? AND user_id=? AND created_at=?",
+                (cid, user_id, conv_created),
             ) is not None
 
         def save_assistant(content: str, status: str) -> int:
@@ -320,8 +321,8 @@ def register_chat_routes(app):
                 (cid, "assistant", content, status, now()),
             )
             db.execute(
-                "UPDATE conversations SET updated_at=? WHERE id=? AND token_hash=? AND created_at=?",
-                (now(), cid, token_hash, conv_created),
+                "UPDATE conversations SET updated_at=? WHERE id=? AND user_id=? AND created_at=?",
+                (now(), cid, user_id, conv_created),
             )
             return cur.lastrowid
 
@@ -344,8 +345,8 @@ def register_chat_routes(app):
                         if not coze_conv_id:
                             coze_conv_id = ev["conversation_id"]
                             db.execute(
-                                "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND token_hash=? AND created_at=?",
-                                (coze_conv_id, cid, token_hash, conv_created),
+                                "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND user_id=? AND created_at=?",
+                                (coze_conv_id, cid, user_id, conv_created),
                             )
                         yield sse("meta", {"conversation_id": coze_conv_id})
                     elif ev["type"] == "delta":

@@ -5,7 +5,8 @@
 运行：.venv/bin/python scripts/browser_acceptance.py
 
 覆盖：流式增量渲染、代码块、插件配图与失败降级、多 answer 完整性、
-Markdown 注入安全、图片上传/带图重发、退出后附件隔离（no-store）。
+Markdown 注入安全、图片上传/带图重发、账号级历史共享（重登后历史/附件仍在）、
+课程插画常驻聊天背景。
 """
 from __future__ import annotations
 
@@ -68,6 +69,7 @@ def main() -> int:
             page.wait_for_selector(".empty-hero", timeout=5000)
             check("开场白显示（扣子配置原文）", "单片机教学助手" in page.inner_text(".empty-hero"))
             check("预置问题 3 条", page.locator(".suggest").count() == 3)
+            check("空态无重复插画卡片（插画已是常驻背景）", page.locator(".hero-art").count() == 0)
             check("错误横幅初始隐藏", not page.locator("#banner").is_visible())
             check("待发送区初始隐藏", not page.locator("#pending").is_visible())
 
@@ -88,6 +90,8 @@ def main() -> int:
             img = body.locator("img.plugin-img")
             img.wait_for(timeout=5000)
             check("插件配图加载", img.evaluate("el => el.naturalWidth") > 0)
+            bg = page.evaluate("getComputedStyle(document.querySelector('.main')).backgroundImage")
+            check("插画常驻聊天背景（发消息后仍在）", "chat-bg.jpg" in bg, bg[:60])
 
             # 3. 配图加载失败降级为链接
             page.fill("#input", "/mock brokenimage")
@@ -176,7 +180,7 @@ def main() -> int:
                 page.click("#scrim", position={"x": 350, "y": 400})
                 page.wait_for_timeout(350)
 
-            # 8. 退出 → 重登 → 旧附件 URL 不得命中缓存（no-store + 归属校验）
+            # 8. 退出 → 重登 → 账号级历史共享：历史与附件仍在（归属键是账号）
             # 移动端视口下退出按钮在侧栏抽屉里，先打开抽屉
             if page.locator("#menu-btn").is_visible():
                 page.click("#menu-btn")
@@ -187,12 +191,14 @@ def main() -> int:
             page.fill('input[name="password"]', PASSWORD)
             page.click('button[type="submit"]')
             page.wait_for_url("**/chat")
-            check("重登后历史为空（新会话）", page.locator(".msg").count() == 0)
+            page.wait_for_selector(".msg", timeout=5000)
+            check("重登后历史仍在（账号级共享）", page.locator(".msg").count() > 0)
             statuses = []
             for u in att_urls:
                 resp = page.goto(u)
                 statuses.append(resp.status if resp else None)
-            check("退出后旧附件全部 404（未走缓存）", all(s == 404 for s in statuses), str(statuses))
+            check("重登后旧附件仍可访问（同账号，no-store 每次重新校验）",
+                  all(s == 200 for s in statuses), str(statuses))
             browser.close()
 
         real_errors = [e for e in console_errors

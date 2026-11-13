@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY,
     token_hash TEXT NOT NULL,
+    user_id INTEGER,
     coze_conversation_id TEXT,
     title TEXT NOT NULL DEFAULT '新对话',
     auto_title INTEGER NOT NULL DEFAULT 1,
@@ -47,9 +48,11 @@ CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, id);
 CREATE TABLE IF NOT EXISTS attachments (
     id INTEGER PRIMARY KEY,
     token_hash TEXT NOT NULL,
+    user_id INTEGER,
     message_id INTEGER,
     orig_name TEXT NOT NULL,
     stored_name TEXT NOT NULL,
+    stored_path TEXT,
     mime TEXT NOT NULL,
     size INTEGER NOT NULL,
     coze_file_id TEXT,
@@ -86,6 +89,39 @@ class Database:
                     self._conn.execute(
                         "UPDATE conversations SET auto_title=0 WHERE title != '新对话'"
                     )
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
+            # 幂等迁移：历史归属从登录会话改为账号（跨设备共享历史）。
+            # 单共享账号应用：全部旧数据归属该账号；附件记录相对存储路径；
+            # 旧聊天的扣子上下文绑在旧的按会话 coze_user_id 上，账号级切换后
+            # 重置以避免追问失败（站点历史完整保留）。与补列同一事务。
+            conv_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
+            att_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(attachments)")}
+            if "user_id" not in conv_cols or "user_id" not in att_cols or "stored_path" not in att_cols:
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    if "user_id" not in conv_cols:
+                        self._conn.execute("ALTER TABLE conversations ADD COLUMN user_id INTEGER")
+                    if "user_id" not in att_cols:
+                        self._conn.execute("ALTER TABLE attachments ADD COLUMN user_id INTEGER")
+                    if "stored_path" not in att_cols:
+                        self._conn.execute("ALTER TABLE attachments ADD COLUMN stored_path TEXT")
+                    self._conn.execute(
+                        "UPDATE conversations SET user_id=(SELECT id FROM users ORDER BY id LIMIT 1)"
+                        " WHERE user_id IS NULL"
+                    )
+                    self._conn.execute(
+                        "UPDATE attachments SET user_id=(SELECT id FROM users ORDER BY id LIMIT 1)"
+                        " WHERE user_id IS NULL"
+                    )
+                    self._conn.execute(
+                        "UPDATE attachments SET stored_path=substr(token_hash,1,16) || '/' || stored_name"
+                        " WHERE stored_path IS NULL"
+                    )
+                    self._conn.execute("UPDATE conversations SET coze_conversation_id=NULL")
                     self._conn.execute("COMMIT")
                 except BaseException:
                     if self._conn.in_transaction:

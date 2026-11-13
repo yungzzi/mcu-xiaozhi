@@ -202,13 +202,7 @@
     messagesEl.textContent = '';
     var hero = document.createElement('div');
     hero.className = 'empty-hero';
-    var art = document.createElement('figure');
-    art.className = 'hero-art';
-    var artImg = document.createElement('img');
-    artImg.src = BASE + 'static/chat-bg.jpg';
-    artImg.alt = '绍兴大学单片机课程插画：STC89C52 最小系统板与校门';
-    art.appendChild(artImg);
-    hero.appendChild(art);
+    /* 课程插画已是聊天区常驻背景，空态不再重复放卡片 */
     var mark = document.createElement('span');
     mark.className = 'brand-mark';
     mark.innerHTML = CHIP_SVG;
@@ -230,7 +224,7 @@
       b.addEventListener('click', function () { send(s.text, []); });
       grid.appendChild(b);
     });
-    hero.appendChild(art); hero.appendChild(mark); hero.appendChild(h2); hero.appendChild(p); hero.appendChild(grid);
+    hero.appendChild(mark); hero.appendChild(h2); hero.appendChild(p); hero.appendChild(grid);
     messagesEl.appendChild(hero);
   }
   function renderStored(m) {

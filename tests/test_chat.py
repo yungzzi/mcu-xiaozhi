@@ -77,19 +77,23 @@ def test_title_from_first_question(auth_client):
     assert convs[0]["title"] == "什么是中断向量表？"
 
 
-def test_ownership_isolation(app):
+def test_history_shared_across_logins(app):
+    """账号级归属：同一账号的不同登录（跨设备）共享历史，可互读/追问/删除。"""
     with TestClient(app) as c1, TestClient(app) as c2:
         login(c1)
         login(c2)
         cid1 = new_conv(c1)
-        c1.post(f"/api/conversations/{cid1}/send", json={"text": "私密问题"})
-        # c2 看不到 c1 的会话
-        assert c2.get("/api/conversations").json() == []
-        assert c2.get(f"/api/conversations/{cid1}/messages").status_code == 404
-        assert c2.post(f"/api/conversations/{cid1}/send", json={"text": "x"}).status_code == 404
-        assert c2.delete(f"/api/conversations/{cid1}").status_code == 404
-        # c1 数据仍在
-        assert len(c1.get(f"/api/conversations/{cid1}/messages").json()["messages"]) == 2
+        c1.post(f"/api/conversations/{cid1}/send", json={"text": "电脑上的问题"})
+        # c2（另一设备登录）能看到 c1 的会话与消息
+        assert [c["id"] for c in c2.get("/api/conversations").json()] == [cid1]
+        assert len(c2.get(f"/api/conversations/{cid1}/messages").json()["messages"]) == 2
+        # c2 追问成功，c1 也能看到追问结果
+        r = c2.post(f"/api/conversations/{cid1}/send", json={"text": "手机上的追问"})
+        assert parse_sse(r.text)[-1][0] == "done"
+        assert len(c1.get(f"/api/conversations/{cid1}/messages").json()["messages"]) == 4
+        # 删除同样账号级共享
+        assert c2.delete(f"/api/conversations/{cid1}").status_code == 200
+        assert c1.get(f"/api/conversations/{cid1}/messages").status_code == 404
 
 
 def test_api_requires_login(client):
@@ -118,7 +122,7 @@ def test_auth_error_classified(auth_client, app):
     assert events[-1][1]["kind"] == "auth"
 
 
-def test_history_page_shows_only_own(app):
+def test_history_page_shared_across_logins(app):
     with TestClient(app) as c1, TestClient(app) as c2:
         login(c1)
         login(c2)
@@ -127,7 +131,7 @@ def test_history_page_shows_only_own(app):
         page1 = c1.get("/history").text
         page2 = c2.get("/history").text
         assert "我的历史" in page1
-        assert "我的历史" not in page2
+        assert "我的历史" in page2
 
 
 def test_delete_conversation(auth_client, app):

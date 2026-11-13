@@ -60,13 +60,14 @@ def test_server_side_expiry_12h(app, client):
     assert client.get("/home", follow_redirects=False).status_code == 303
 
 
-def test_two_logins_have_distinct_coze_user_ids(app):
+def test_two_logins_share_account_coze_user_id(app):
+    """账号级历史共享：同一账号的不同登录共用稳定的 coze_user_id（跨设备追问连续）。"""
     with TestClient(app) as c1, TestClient(app) as c2:
         login(c1)
         login(c2)
         rows = app.state.db.query("SELECT coze_user_id FROM sessions")
         ids = [r["coze_user_id"] for r in rows]
-        assert len(ids) == 2 and ids[0] != ids[1]
+        assert len(ids) == 2 and ids[0] == ids[1]
         assert all(i.startswith("mcu-") for i in ids)
 
 

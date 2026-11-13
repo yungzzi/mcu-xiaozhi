@@ -243,9 +243,11 @@ a { color: var(--maroon); }
   flex: 1; min-width: 0;
   display: flex; flex-direction: column;
   position: relative;
+  /* 课程插画常驻聊天背景：发消息后不消失；暖纸罩层保证文字可读。
+     url 相对 CSS 文件解析，自动适配反代前缀。 */
   background:
-    radial-gradient(800px 400px at 100% 0%, rgba(201, 160, 99, .07), transparent 60%),
-    linear-gradient(rgba(246, 241, 232, .6), rgba(246, 241, 232, .9)),
+    linear-gradient(rgba(246, 241, 232, .84), rgba(246, 241, 232, .78)),
+    url("chat-bg.jpg") center / cover no-repeat,
     var(--paper);
 }
 .chat-head {
@@ -382,24 +384,11 @@ pre.code {
   border-radius: 7px; font-size: .76rem;
 }
 
-/* 空态 */
+/* 空态（插画已是常驻背景，这里不再重复放卡片） */
 .empty-hero {
   margin: auto; max-width: 620px; width: 100%;
   text-align: center; padding: 20px 10px;
   animation: riseIn .5s ease both;
-}
-.hero-art {
-  margin: 0 0 20px;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: #f1e9dc;
-  box-shadow: var(--shadow-1);
-  overflow: hidden;
-}
-.hero-art img {
-  display: block; width: 100%;
-  max-height: 235px;
-  object-fit: contain;
 }
 .empty-hero .brand-mark { width: 62px; height: 62px; border-radius: 17px; margin-bottom: 16px; }
 .empty-hero .brand-mark svg { width: 32px; height: 32px; }
@@ -576,7 +565,6 @@ pre.code {
   .composer-zone { padding: 6px 10px 10px; }
   .login-photo img { height: 150px; }
   .login-body { padding: 20px 22px 18px; }
-  .hero-art img { max-height: 165px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
