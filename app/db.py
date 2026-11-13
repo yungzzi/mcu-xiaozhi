@@ -73,14 +73,24 @@ class Database:
             # 手动重命名后置 0，避免同名默认标题被首问覆盖，审阅 P2）
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
             if "auto_title" not in cols:
-                self._conn.execute(
-                    "ALTER TABLE conversations ADD COLUMN auto_title INTEGER NOT NULL DEFAULT 1"
-                )
-                # 旧版已自动命名过的聊天（非默认标题）升级后不得再被追问覆盖：
-                # 只有仍是默认「新对话」的空聊天保留自动命名资格（审阅迁移 P2）
-                self._conn.execute(
-                    "UPDATE conversations SET auto_title=0 WHERE title != '新对话'"
-                )
+                # 补列与回填必须在同一事务内（审阅迁移 P2）：sqlite3 默认
+                # 隔离级别下 ALTER TABLE 会立即自动提交，若两者之间中断，
+                # 重启将因列已存在而跳过回填。显式事务保证失败时一起回滚。
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    self._conn.execute(
+                        "ALTER TABLE conversations ADD COLUMN auto_title INTEGER NOT NULL DEFAULT 1"
+                    )
+                    # 旧版已自动命名过的聊天（非默认标题）升级后不得再被追问覆盖：
+                    # 只有仍是默认「新对话」的空聊天保留自动命名资格
+                    self._conn.execute(
+                        "UPDATE conversations SET auto_title=0 WHERE title != '新对话'"
+                    )
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
             self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:

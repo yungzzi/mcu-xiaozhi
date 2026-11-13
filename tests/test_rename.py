@@ -222,6 +222,41 @@ def test_migration_adds_auto_title(tmp_path):
         db2.close()
 
 
+def test_migration_atomic_rollback_and_retry(tmp_path):
+    """审阅迁移 P2 回归：回填失败时补列一起回滚，重启能重新完成迁移。
+
+    用 SQLite 触发器在回填 UPDATE 时注入失败（RAISE(ABORT)），
+    不依赖对 C 类型 sqlite3.Connection 打补丁。
+    """
+    path = tmp_path / "old.db"
+    _make_old_db(path, [("h", "晶振电路答疑"), ("h", "新对话")])
+    conn = sqlite3.connect(str(path))
+    conn.execute("""
+        CREATE TRIGGER fail_backfill BEFORE UPDATE ON conversations
+        WHEN NEW.auto_title = 0 AND OLD.auto_title = 1
+        BEGIN SELECT RAISE(ABORT, 'simulated backfill failure'); END;
+    """)
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.Error):
+        Database(path)
+    # 补列必须已随事务回滚：列不存在，重启才会重新走完整迁移
+    conn = sqlite3.connect(str(path))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+    assert "auto_title" not in cols, "回填失败后补列未回滚，重启将跳过回填"
+    conn.execute("DROP TRIGGER fail_backfill")
+    conn.commit()
+    conn.close()
+
+    db = Database(path)  # 重启重新完成迁移
+    try:
+        rows = {r["title"]: r["auto_title"] for r in db.query("SELECT title, auto_title FROM conversations")}
+        assert rows == {"晶振电路答疑": 0, "新对话": 1}
+    finally:
+        db.close()
+
+
 def test_old_db_titles_survive_followup(settings):
     """审阅迁移 P2 回归：从 0.1.3 旧库启动，已有课程标题追问后保持原样；
     旧库里尚未命名的空聊天仍能自动命名。"""
