@@ -26,6 +26,40 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def build_restore_history(db, cid: int) -> list[dict]:
+    """旧扣子身份找不回时，用近期成功问答对重建上下文（审阅调整）。
+
+    先组成完整的成功问答对（ok 回答 + 其前对应的 ok 用户问题），再按对数
+    截取（最多 10 对，单条截断 1000 字）；孤立回答、失败轮次、当前尚未
+    回答的问题都不带入。返回带 role 的消息列表，经 additional_messages
+    发送，不拼成一条用户消息。
+    """
+    rows = db.query(
+        "SELECT role, content, status FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 120",
+        (cid,),
+    )
+    pairs: list[tuple[str, str]] = []
+    pending_answer: str | None = None
+    for r in rows:  # 从最新往回配对
+        if r["role"] == "assistant" and r["status"] == "ok":
+            # 连续出现多条回答时，较新的孤立回答被覆盖丢弃，
+            # 问题只与其紧邻其后的回答配对
+            pending_answer = r["content"][:1000]
+        elif r["role"] == "assistant":
+            pending_answer = None  # 失败/中断的回答断开配对链
+        elif r["role"] == "user" and r["status"] == "ok" and pending_answer is not None:
+            pairs.append((r["content"][:1000], pending_answer))
+            pending_answer = None
+            if len(pairs) >= 10:
+                break
+    pairs.reverse()
+    history: list[dict] = []
+    for q, a in pairs:
+        history.append({"role": "user", "content": q})
+        history.append({"role": "assistant", "content": a})
+    return history
+
+
 class _LockGuard:
     """幂等释放 holders：endpoint 建立阶段、生成器、响应生命周期共用同一个 guard。
 
@@ -83,8 +117,9 @@ def register_chat_routes(app):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     def owned_conv(session, cid: int):
+        # 账号级归属：同一共享账号的所有设备/登录会话共享历史（跨设备需求）
         return db.query_one(
-            "SELECT * FROM conversations WHERE id=? AND token_hash=?", (cid, session["token_hash"])
+            "SELECT * FROM conversations WHERE id=? AND user_id=?", (cid, session["user_id"])
         )
 
     @app.get("/chat", name="chat_page")
@@ -101,8 +136,8 @@ def register_chat_routes(app):
         if session is None:
             return login_redirect()
         convs = db.query(
-            "SELECT id, title, updated_at FROM conversations WHERE token_hash=? ORDER BY updated_at DESC",
-            (session["token_hash"],),
+            "SELECT id, title, updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC",
+            (session["user_id"],),
         )
         return templates.TemplateResponse(request, "history.html", {"convs": convs})
 
@@ -112,8 +147,8 @@ def register_chat_routes(app):
         if session is None:
             return unauthorized()
         rows = db.query(
-            "SELECT id, title, created_at, updated_at FROM conversations WHERE token_hash=? ORDER BY updated_at DESC",
-            (session["token_hash"],),
+            "SELECT id, title, created_at, updated_at FROM conversations WHERE user_id=? ORDER BY updated_at DESC",
+            (session["user_id"],),
         )
         return [dict(r) for r in rows]
 
@@ -124,8 +159,9 @@ def register_chat_routes(app):
             return unauthorized()
         t = now()
         cur = db.execute(
-            "INSERT INTO conversations(token_hash, title, created_at, updated_at) VALUES(?,?,?,?)",
-            (session["token_hash"], "新对话", t, t),
+            "INSERT INTO conversations(token_hash, user_id, coze_user_id, title, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (session["token_hash"], session["user_id"], session["coze_user_id"], "新对话", t, t),
         )
         return {"id": cur.lastrowid, "title": "新对话"}
 
@@ -165,7 +201,7 @@ def register_chat_routes(app):
         try:
             db.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)", (cid,))
             db.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
-            db.execute("DELETE FROM conversations WHERE id=? AND token_hash=?", (cid, session["token_hash"]))
+            db.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (cid, session["user_id"]))
         finally:
             lock.release()
         return {"ok": True}
@@ -202,8 +238,8 @@ def register_chat_routes(app):
                 return JSONResponse({"error": "not_found"}, status_code=404)
             cur = db.execute(
                 "UPDATE conversations SET title=?, auto_title=0"
-                " WHERE id=? AND token_hash=? AND created_at=?",
-                (title, cid, session["token_hash"], conv["created_at"]),
+                " WHERE id=? AND user_id=? AND created_at=?",
+                (title, cid, session["user_id"], conv["created_at"]),
             )
             if cur.rowcount == 0:
                 return JSONResponse({"error": "not_found"}, status_code=404)
@@ -255,11 +291,17 @@ def register_chat_routes(app):
                 return JSONResponse({"error": "not_found"}, status_code=404)
             conv = conv_now
 
+            # 恢复历史读取也在释放保护内、且在写入本次用户消息之前
+            # （审阅 P1：查询失败必须释放锁，不能占锁到 409）
+            restore_history: list[dict] = []
+            if conv["context_restore"]:
+                restore_history = build_restore_history(db, cid)
+
             file_ids = []
             link_ids = []  # 将关联到新消息的附件行 id
             for aid in attachment_ids:
                 att = db.query_one(
-                    "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
+                    "SELECT * FROM attachments WHERE id=? AND user_id=?", (aid, session["user_id"])
                 )
                 if att is None:
                     guard.release()
@@ -270,10 +312,10 @@ def register_chat_routes(app):
                     # 重发：复制一条新索引行（共用磁盘文件与 coze_file_id），
                     # 不改动旧消息与附件的关联（审阅 P2 修复）
                     copy_cur = db.execute(
-                        "INSERT INTO attachments(token_hash, orig_name, stored_name, mime, size, coze_file_id, created_at)"
-                        " VALUES(?,?,?,?,?,?,?)",
-                        (session["token_hash"], att["orig_name"], att["stored_name"],
-                         att["mime"], att["size"], att["coze_file_id"], now()),
+                        "INSERT INTO attachments(token_hash, user_id, orig_name, stored_name, stored_path, mime, size, coze_file_id, created_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?)",
+                        (session["token_hash"], session["user_id"], att["orig_name"], att["stored_name"],
+                         att["stored_path"], att["mime"], att["size"], att["coze_file_id"], now()),
                     )
                     link_ids.append(copy_cur.lastrowid)
                 if att["coze_file_id"]:
@@ -291,8 +333,8 @@ def register_chat_routes(app):
             if conv["auto_title"] and text:
                 db.execute(
                     "UPDATE conversations SET title=?, auto_title=0"
-                    " WHERE id=? AND token_hash=? AND created_at=?",
-                    (text[:30], cid, session["token_hash"], conv["created_at"]),
+                    " WHERE id=? AND user_id=? AND created_at=?",
+                    (text[:30], cid, session["user_id"], conv["created_at"]),
                 )
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
         except Exception:
@@ -300,16 +342,19 @@ def register_chat_routes(app):
             raise
 
         coze_conv_id = conv["coze_conversation_id"]
-        token_hash = session["token_hash"]
-        coze_user_id = session["coze_user_id"]
+        user_id = session["user_id"]
+        # 扣子上下文跟聊天走：用该聊天保存的 ID 对；新聊天/找不回旧身份的聊天
+        # 回落到账号级标识（审阅调整）
+        coze_user_id = conv["coze_user_id"] or session["coze_user_id"]
         conv_created = conv["created_at"]
+        restore = bool(conv["context_restore"])
 
         def conv_alive() -> bool:
             # 写入时校验：会话仍存在、归属一致、且是本轮开始时的同一会话
             # （created_at 防止 SQLite 复用已删除整数 ID 后误写新会话，审阅二轮 P1）
             return db.query_one(
-                "SELECT id FROM conversations WHERE id=? AND token_hash=? AND created_at=?",
-                (cid, token_hash, conv_created),
+                "SELECT id FROM conversations WHERE id=? AND user_id=? AND created_at=?",
+                (cid, user_id, conv_created),
             ) is not None
 
         def save_assistant(content: str, status: str) -> int:
@@ -320,8 +365,8 @@ def register_chat_routes(app):
                 (cid, "assistant", content, status, now()),
             )
             db.execute(
-                "UPDATE conversations SET updated_at=? WHERE id=? AND token_hash=? AND created_at=?",
-                (now(), cid, token_hash, conv_created),
+                "UPDATE conversations SET updated_at=? WHERE id=? AND user_id=? AND created_at=?",
+                (now(), cid, user_id, conv_created),
             )
             return cur.lastrowid
 
@@ -336,6 +381,7 @@ def register_chat_routes(app):
                     conversation_id=coze_conv_id,
                     text=text,
                     file_ids=file_ids or None,
+                    history=restore_history or None,
                 )
             )
             try:
@@ -343,10 +389,12 @@ def register_chat_routes(app):
                     if ev["type"] == "meta":
                         if not coze_conv_id:
                             coze_conv_id = ev["conversation_id"]
-                            db.execute(
-                                "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND token_hash=? AND created_at=?",
-                                (coze_conv_id, cid, token_hash, conv_created),
-                            )
+                            # 恢复模式：整轮成功后才切换映射（失败则下次仍带历史）
+                            if not restore:
+                                db.execute(
+                                    "UPDATE conversations SET coze_conversation_id=? WHERE id=? AND user_id=? AND created_at=?",
+                                    (coze_conv_id, cid, user_id, conv_created),
+                                )
                         yield sse("meta", {"conversation_id": coze_conv_id})
                     elif ev["type"] == "delta":
                         acc.append(ev["text"])
@@ -355,14 +403,47 @@ def register_chat_routes(app):
                         content = ev["content"]
                 if content is None:
                     content = "".join(acc)
-                msg_id = save_assistant(content, "ok")
+                if restore and coze_conv_id:
+                    # 恢复模式：最终回复入库 + 映射切换放同一事务（审阅建议），
+                    # 避免回复已存为成功而映射更新失败、下次重复恢复。
+                    msg_id = -1
+                    if conv_alive():
+                        with db.transaction() as conn:
+                            cur = conn.execute(
+                                "INSERT INTO messages(conversation_id, role, content, status, created_at)"
+                                " VALUES(?,?,?,?,?)",
+                                (cid, "assistant", content, "ok", now()),
+                            )
+                            msg_id = cur.lastrowid
+                            conn.execute(
+                                "UPDATE conversations SET updated_at=? WHERE id=? AND user_id=? AND created_at=?",
+                                (now(), cid, user_id, conv_created),
+                            )
+                            conn.execute(
+                                "UPDATE conversations SET coze_conversation_id=?, coze_user_id=?, context_restore=0"
+                                " WHERE id=? AND user_id=? AND created_at=?",
+                                (coze_conv_id, coze_user_id, cid, user_id, conv_created),
+                            )
+                else:
+                    msg_id = save_assistant(content, "ok")
                 saved = True
                 yield sse("done", {"message_id": msg_id, "content": content, "status": "ok"})
             except CozeError as exc:
                 content = "".join(acc)
                 if not saved:
                     save_assistant(content, exc.kind)
-                yield sse("error", {"kind": exc.kind, "message": exc.message, "code": exc.code})
+                message = exc.message
+                if exc.kind == "conversation_invalid" and not restore and coze_conv_id:
+                    # 扣子明确判定旧会话不存在/不可访问：旧 ID 留作记录，
+                    # 下次发送自动带近期历史重建（4028/超时/断线不走这里，保留旧映射）
+                    db.execute(
+                        "UPDATE conversations SET legacy_coze_conversation_id=coze_conversation_id,"
+                        " coze_conversation_id=NULL, coze_user_id=NULL, context_restore=1"
+                        " WHERE id=? AND user_id=? AND created_at=?",
+                        (cid, user_id, conv_created),
+                    )
+                    message = "原扣子会话不可用，下次发送将自动带上近期历史重建上下文"
+                yield sse("error", {"kind": exc.kind, "message": message, "code": exc.code})
             except (asyncio.CancelledError, GeneratorExit):
                 if not saved:
                     save_assistant("".join(acc), "interrupted")

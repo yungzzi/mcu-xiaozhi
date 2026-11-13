@@ -1,7 +1,7 @@
 """图片上传与附件读取：格式/大小校验 → 持久卷存原图 → 扣子 uploadFile 换 file_id。
 
 - 首版仅支持 JPG/PNG：扩展名 + 魔数双重校验（不做完整解码）。
-- 附件按登录会话隔离，读取逐次校验归属。
+- 附件按账号共享（跨设备），读取逐次校验账号归属。
 - 删除聊天只删索引，磁盘文件保留（避免不可逆删除；容量治理后续再做）。
 """
 from __future__ import annotations
@@ -51,10 +51,11 @@ def register_upload_routes(app):
         if not data.startswith(magic):
             return JSONResponse({"error": "invalid_type", "message": "文件内容与图片格式不符"}, status_code=400)
 
-        subdir = settings.upload_dir / session["token_hash"][:16]
+        subdir = settings.upload_dir / f"user-{session['user_id']}"
         subdir.mkdir(parents=True, exist_ok=True)
         stored_name = secrets.token_hex(12) + ext
         (subdir / stored_name).write_bytes(data)
+        stored_path = f"user-{session['user_id']}/{stored_name}"
 
         try:
             file_id = await client.upload_file(name, data, mime)
@@ -64,9 +65,9 @@ def register_upload_routes(app):
                 status_code=502,
             )
         cur = db.execute(
-            "INSERT INTO attachments(token_hash, orig_name, stored_name, mime, size, coze_file_id, created_at)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (session["token_hash"], name, stored_name, mime, len(data), file_id, now()),
+            "INSERT INTO attachments(token_hash, user_id, orig_name, stored_name, stored_path, mime, size, coze_file_id, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (session["token_hash"], session["user_id"], name, stored_name, stored_path, mime, len(data), file_id, now()),
         )
         return {"id": cur.lastrowid, "orig_name": name, "mime": mime, "size": len(data)}
 
@@ -76,16 +77,16 @@ def register_upload_routes(app):
         if session is None:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         att = db.query_one(
-            "SELECT * FROM attachments WHERE id=? AND token_hash=?", (aid, session["token_hash"])
+            "SELECT * FROM attachments WHERE id=? AND user_id=?", (aid, session["user_id"])
         )
         if att is None:
             return JSONResponse({"error": "not_found"}, status_code=404)
-        path = settings.upload_dir / session["token_hash"][:16] / att["stored_name"]
+        path = settings.upload_dir / att["stored_path"]
         if not path.is_file():
             return JSONResponse({"error": "not_found"}, status_code=404)
         return FileResponse(
             path,
             media_type=att["mime"],
-            # no-store：私有附件不得命中浏览器缓存，退出后同 URL 必须重新走归属校验（审阅 P2）
+            # no-store：附件不得命中浏览器缓存，每次访问都重新走归属校验（审阅 P2）
             headers={"Cache-Control": "no-store", "Content-Disposition": "inline"},
         )

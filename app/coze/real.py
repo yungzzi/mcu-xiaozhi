@@ -16,17 +16,37 @@ import httpx
 
 from .base import ChatRequest, CozeError
 
-# 待联调核对：HTTP 状态 → kind
+# HTTP 状态 → kind
 _HTTP_KIND = {401: "auth", 403: "auth", 429: "quota"}
-# 待联调核对：业务错误消息关键字 → kind（保留原始 code 供日志/审阅）
+# 官方错误码（docs.coze.cn/developer_guides/coze_error_codes，已核对）：
+# 4002 = invalid conversation（id 错误/找不到/无权限）→ 进入上下文重建
+_CONV_INVALID_CODES = {4002}
+# 积分类：保留原映射，由用户决定重试，不触发重建
+_QUOTA_CODES = {4011, 4019, 4022, 4028}
+# 通用鉴权类：保留原映射
+_AUTH_CODES = {4100, 4101}
+# 待联调核对：业务错误消息关键字 → kind（错误码的补充判定）
 _QUOTA_HINTS = ("quota", "额度", "exceed", "limit", "balance")
 _AUTH_HINTS = ("token", "auth", "unauthorized", "credential", "pat ")
+_CONV_INVALID_HINTS = ("not exist", "not found", "invalid", "no permission", "access denied", "deleted")
 
 
 def classify(code, message: str, http_status: int | None = None) -> str:
     if http_status in _HTTP_KIND:
         return _HTTP_KIND[http_status]
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        c = None
+    if c in _CONV_INVALID_CODES:
+        return "conversation_invalid"
+    if c in _QUOTA_CODES:
+        return "quota"
+    if c in _AUTH_CODES:
+        return "auth"
     low = (message or "").lower()
+    if "conversation" in low and any(h in low for h in _CONV_INVALID_HINTS):
+        return "conversation_invalid"
     if any(h in low for h in _QUOTA_HINTS):
         return "quota"
     if any(h in low for h in _AUTH_HINTS):
@@ -68,15 +88,27 @@ class RealCozeClient:
                 + [{"type": "image", "file_id": fid} for fid in req.file_ids],
                 ensure_ascii=False,
             )
-            message = {"role": "user", "content": content, "content_type": "object_string"}
+            message = {"role": "user", "type": "question", "content": content, "content_type": "object_string"}
         else:
-            message = {"role": "user", "content": req.text, "content_type": "text"}
+            message = {"role": "user", "type": "question", "content": req.text, "content_type": "text"}
+        # 上下文重建：近期成功问答对按 role 放入 additional_messages，
+        # 最后一条才是本次问题（审阅 P2，不拼成单条用户消息）
+        messages = [
+            {
+                "role": h["role"],
+                "type": "answer" if h["role"] == "assistant" else "question",
+                "content": h["content"],
+                "content_type": "text",
+            }
+            for h in (req.history or [])
+        ]
+        messages.append(message)
         payload = {
             "bot_id": self.settings.coze_bot_id,
             "user_id": req.user_id,
             "stream": True,
             "auto_save_history": True,
-            "additional_messages": [message],
+            "additional_messages": messages,
         }
         params = {}
         if req.conversation_id:

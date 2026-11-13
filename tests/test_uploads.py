@@ -29,7 +29,7 @@ def test_upload_png_ok(auth_client, app, tmp_path):
     assert body["mime"] == "image/png" and body["size"] == len(PNG)
     att = app.state.db.query_one("SELECT * FROM attachments WHERE id=?", (body["id"],))
     assert att["coze_file_id"].startswith("mock-file-")
-    stored = app.state.settings.upload_dir / att["token_hash"][:16] / att["stored_name"]
+    stored = app.state.settings.upload_dir / att["stored_path"]
     assert stored.read_bytes() == PNG
     assert len(app.state.coze.uploads) == 1
 
@@ -64,7 +64,8 @@ def test_reject_oversize(tmp_path):
         assert r.json()["error"] == "too_large"
 
 
-def test_attachment_ownership(app):
+def test_attachment_shared_across_logins(app):
+    """账号级归属：另一设备登录可读取同一账号的附件（仍逐次校验登录与归属）。"""
     with TestClient(app) as c1, TestClient(app) as c2:
         login(c1)
         login(c2)
@@ -73,7 +74,9 @@ def test_attachment_ownership(app):
         assert r1.status_code == 200
         assert r1.headers["content-type"] == "image/png"
         assert r1.content == PNG
-        assert c2.get(f"/api/attachments/{aid}").status_code == 404
+        r2 = c2.get(f"/api/attachments/{aid}")
+        assert r2.status_code == 200
+        assert r2.content == PNG
 
 
 def test_upload_requires_login(client):
@@ -97,14 +100,16 @@ def test_send_with_image(auth_client, app):
     assert "file_id=" in msgs[1]["content"]
 
 
-def test_send_foreign_attachment_rejected(app):
+def test_send_shared_attachment_ok(app):
+    """账号级归属：另一设备登录可用同一账号上传的附件发起图文问答。"""
     with TestClient(app) as c1, TestClient(app) as c2:
         login(c1)
         login(c2)
         aid = upload(c1).json()["id"]
         cid = c2.post("/api/conversations").json()["id"]
         r = c2.post(f"/api/conversations/{cid}/send", json={"text": "x", "attachment_ids": [aid]})
-        assert r.status_code == 404
+        assert r.status_code == 200
+        assert app.state.coze.calls[-1].file_ids
 
 
 def test_coze_upload_failure(auth_client):

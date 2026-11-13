@@ -288,14 +288,15 @@ def _drive_with_body_mutation(app, cookie, cid, mutate):
 def test_conv_replaced_during_body_read(app, env):
     """审阅三轮 P1 回归：读请求体期间旧会话被删且 ID 被复用 → 404，不写入新会话。"""
     c, cookie, cid = env
-    token_hash = app.state.db.query_one(
-        "SELECT token_hash FROM conversations WHERE id=?", (cid,))["token_hash"]
+    row = app.state.db.query_one(
+        "SELECT token_hash, user_id FROM conversations WHERE id=?", (cid,))
+    token_hash, user_id = row["token_hash"], row["user_id"]
 
     def mutate():
         app.state.db.execute("DELETE FROM conversations WHERE id=?", (cid,))
         app.state.db.execute(
-            "INSERT INTO conversations(id, token_hash, title, created_at, updated_at) VALUES(?,?,?,?,?)",
-            (cid, token_hash, "新对话", now() + 10, now() + 10),
+            "INSERT INTO conversations(id, token_hash, user_id, title, created_at, updated_at) VALUES(?,?,?,?,?,?)",
+            (cid, token_hash, user_id, "新对话", now() + 10, now() + 10),
         )
 
     statuses = _drive_with_body_mutation(app, cookie, cid, mutate)

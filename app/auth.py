@@ -3,7 +3,8 @@
 - 密码：PBKDF2-HMAC-SHA256 哈希存服务端。
 - Cookie：只持有随机 token；服务端存其 SHA-256。
 - 记住登录：15 天持久 Cookie；未记住：浏览器会话 Cookie + 服务端 12 小时上限。
-- 每个登录会话分配独立 coze_user_id；改密撤销全部会话。
+- coze_user_id 账号级稳定：同一账号所有设备/登录共用，保证跨设备追问上下文连续。
+- 改密撤销全部会话。
 """
 from __future__ import annotations
 
@@ -39,11 +40,23 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def account_coze_user_id(username: str) -> str:
+    """账号级稳定的扣子用户标识：同一账号的所有设备/登录共用，
+    使跨设备打开同一聊天时追问能复用扣子上下文。"""
+    return "mcu-" + hashlib.sha256(("mcu-account:" + username).encode()).hexdigest()[:24]
+
+
 class AuthService:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
         self.settings = settings
         self._ensure_user()
+        # 升级兼容：把存量会话的按会话随机 coze_user_id 归一为账号级标识
+        # （幂等；旧聊天的扣子上下文已在 db 迁移中重置）
+        self.db.execute(
+            "UPDATE sessions SET coze_user_id=?",
+            (account_coze_user_id(self.settings.username),),
+        )
 
     def _ensure_user(self) -> None:
         row = self.db.query_one("SELECT id FROM users WHERE username=?", (self.settings.username,))
@@ -76,7 +89,7 @@ class AuthService:
             (
                 token_hash(token),
                 user["id"],
-                "mcu-" + secrets.token_hex(8),
+                account_coze_user_id(username),
                 1 if remember else 0,
                 now(),
                 expires,

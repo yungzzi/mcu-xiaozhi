@@ -7,7 +7,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.auth import COOKIE_NAME
+from app.auth import COOKIE_NAME, hash_password
 from app.db import Database, now
 from conftest import PASSWORD, login
 from test_chat import new_conv, parse_sse
@@ -48,13 +48,14 @@ def test_rename_requires_login(client):
     assert client.patch("/api/conversations/1", json={"title": "x"}).status_code == 401
 
 
-def test_rename_ownership(app):
+def test_rename_shared_across_logins(app):
+    """账号级归属：另一设备登录可重命名同一账号的聊天。"""
     with TestClient(app) as c1, TestClient(app) as c2:
         login(c1)
         login(c2)
         cid = new_conv(c1)
-        assert c2.patch(f"/api/conversations/{cid}", json={"title": "偷改"}).status_code == 404
-        assert c1.get("/api/conversations").json()[0]["title"] == "新对话"
+        assert c2.patch(f"/api/conversations/{cid}", json={"title": "跨设备改名"}).status_code == 200
+        assert c1.get("/api/conversations").json()[0]["title"] == "跨设备改名"
 
 
 def test_rename_missing_conv(auth_client):
@@ -124,8 +125,9 @@ def test_rename_during_body_read_id_reuse(app):
         login(c)
         cookie = c.cookies.get(COOKIE_NAME)
         cid = c.post("/api/conversations").json()["id"]
-        token_hash = app.state.db.query_one(
-            "SELECT token_hash FROM conversations WHERE id=?", (cid,))["token_hash"]
+        row = app.state.db.query_one(
+            "SELECT token_hash, user_id FROM conversations WHERE id=?", (cid,))
+        token_hash, user_id = row["token_hash"], row["user_id"]
 
         async def run():
             body = json.dumps({"title": "迟到的改名"}).encode()
@@ -152,9 +154,9 @@ def test_rename_during_body_read_id_reuse(app):
                     # 请求体送达前：删除旧聊天，新建聊天复用同一整数 ID
                     app.state.db.execute("DELETE FROM conversations WHERE id=?", (cid,))
                     app.state.db.execute(
-                        "INSERT INTO conversations(id, token_hash, title, created_at, updated_at)"
-                        " VALUES(?,?,?,?,?)",
-                        (cid, token_hash, "新对话", now() + 10, now() + 10),
+                        "INSERT INTO conversations(id, token_hash, user_id, title, created_at, updated_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (cid, token_hash, user_id, "新对话", now() + 10, now() + 10),
                     )
                 return {"type": "http.request", "body": body, "more_body": False}
 
@@ -178,10 +180,16 @@ def test_rename_during_body_read_id_reuse(app):
 
 
 def _make_old_db(path, rows):
-    """构造 0.1.3 旧库（conversations 无 auto_title 列）。rows: (token_hash, title)。"""
+    """构造 0.1.3 旧库（conversations 无 auto_title/user_id 列）。rows: (token_hash, title)。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            password_version INTEGER NOT NULL DEFAULT 1
+        );
         CREATE TABLE conversations (
             id INTEGER PRIMARY KEY,
             token_hash TEXT NOT NULL,
@@ -191,6 +199,8 @@ def _make_old_db(path, rows):
             updated_at REAL NOT NULL
         );
     """)
+    conn.execute("INSERT INTO users(username, password_hash) VALUES('mcu', ?)",
+                 (hash_password(PASSWORD),))
     for th, title in rows:
         conn.execute(
             "INSERT INTO conversations(token_hash, title, created_at, updated_at) VALUES(?,?,1,1)",
