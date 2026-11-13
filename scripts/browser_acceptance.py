@@ -64,6 +64,13 @@ def main() -> int:
             page.wait_for_url("**/chat")
             check("登录跳转 /chat", page.url.endswith("/chat"))
 
+            # 1.5 开场白 + 预置问题 + 错误横幅初始隐藏
+            page.wait_for_selector(".empty-hero", timeout=5000)
+            check("开场白显示（扣子配置原文）", "单片机教学助手" in page.inner_text(".empty-hero"))
+            check("预置问题 3 条", page.locator(".suggest").count() == 3)
+            check("错误横幅初始隐藏", not page.locator("#banner").is_visible())
+            check("待发送区初始隐藏", not page.locator("#pending").is_visible())
+
             # 2. 流式增量 + 代码块 + 插件配图
             page.fill("#input", "给我代码示例和配图 /mock image")
             page.click("#send")
@@ -152,6 +159,22 @@ def main() -> int:
             check("删除被拒后历史列表保留", hist.locator(".conv-list li").count() >= 1)
             hist.close()
             page.wait_for_selector(".msg.assistant .body.streaming", state="detached", timeout=30000)
+
+            # 7.6 侧栏内联重命名（移动端先打开抽屉）
+            if page.locator("#menu-btn").is_visible():
+                page.click("#menu-btn")
+                page.wait_for_selector("#sidebar.open", timeout=5000)
+            page.hover(".conv-item.active")
+            page.click(".conv-item.active .conv-pen")
+            page.wait_for_selector(".conv-item.active .rename-input", timeout=5000)
+            page.fill(".conv-item.active .rename-input", "重命名验收聊天")
+            page.press(".conv-item.active .rename-input", "Enter")
+            page.wait_for_timeout(600)
+            check("侧栏重命名生效", page.inner_text("#conv-title") == "重命名验收聊天")
+            check("侧栏列表标题同步", "重命名验收聊天" in page.inner_text("#conv-list"))
+            if page.locator("#sidebar.open").count():
+                page.click("#scrim", position={"x": 350, "y": 400})
+                page.wait_for_timeout(350)
 
             # 8. 退出 → 重登 → 旧附件 URL 不得命中缓存（no-store + 归属校验）
             # 移动端视口下退出按钮在侧栏抽屉里，先打开抽屉

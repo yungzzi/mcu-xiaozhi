@@ -6,7 +6,6 @@
   <div class="login-card">
     <figure class="login-photo">
       <img src="{{ url_for('static', path='login-bg.jpg') }}" alt="MCS-51 单片机实验板与万用表课程实拍">
-      <figcaption><span class="cap-dot" aria-hidden="true"></span>课程实拍 · MCS-51 实验板与测量工具</figcaption>
     </figure>
     <div class="login-body">
       <div class="login-brand">
@@ -15,10 +14,8 @@
         </span>
         <div class="login-titles">
           <h1>MCU 小智</h1>
-          <p>绍兴大学 · 单片机课程 AI 助手</p>
         </div>
       </div>
-      <p class="login-lede">电路分析、代码示例、课程配图——向小智提问，即刻获得解答。</p>
       {% if msg %}<p class="login-error" role="alert">{{ msg }}</p>{% endif %}
       <form method="post" action="{{ url_for('login_submit') }}" class="login-form">
         <label class="field">
@@ -42,7 +39,6 @@
         </label>
         <button type="submit" class="login-submit">进入课程助手</button>
       </form>
-      <p class="login-foot">老师和学生共用一组账号密码 · 历史按登录会话独立保存</p>
     </div>
   </div>
 </main>

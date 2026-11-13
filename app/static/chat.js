@@ -24,8 +24,15 @@
   var lastAttachmentIds = [];
   var pending = [];
 
+  var OPENING = { greeting: '你好！我是单片机教学助手，能帮你：画电路原理图、查知识点、提供参考代码。有啥需要直接说～', presets: [] };
+  try {
+    var od = document.getElementById('opening-data');
+    if (od) OPENING = JSON.parse(od.textContent);
+  } catch (e) { /* 配置缺失时用默认开场白 */ }
+
   var CHIP_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4"/><path d="M9 6V3M15 6V3M9 21v-3M15 21v-3M6 9H3M6 15H3M21 9h-3M21 15h-3"/></svg>';
   var TRASH_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V5h6v2M6.5 7l1 13h9l1-13M10 11v6M14 11v6"/></svg>';
+  var PEN_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19z"/></svg>';
 
   /* ---------- 安全 Markdown：纯 DOM 构造 ---------- */
   var BASE = location.pathname.replace(/[^/]*$/, '');
@@ -208,25 +215,22 @@
     var h2 = document.createElement('h2');
     h2.textContent = '你好，我是 MCU 小智';
     var p = document.createElement('p');
-    p.textContent = '绍兴大学单片机课程助手。电路原理、代码示例、课程配图，都可以问我。';
+    p.className = 'opening-text';
+    p.textContent = OPENING.greeting;
     var grid = document.createElement('div');
     grid.className = 'suggest-grid';
-    [
-      ['画一张原理图', '画一个51单片机最小系统版原理图'],
-      ['讲清一个电路', '晶振电路在最小系统里起什么作用？负载电容怎么选？'],
-      ['来一段代码', '给我一段 51 单片机 LED 闪烁的 C 代码示例']
-    ].forEach(function (s) {
+    (OPENING.presets || []).forEach(function (s) {
       var b = document.createElement('button');
       b.type = 'button';
       b.className = 'suggest';
       var t = document.createElement('strong');
-      t.textContent = s[0];
+      t.textContent = s.label || '试着问';
       b.appendChild(t);
-      b.appendChild(document.createTextNode(s[1]));
-      b.addEventListener('click', function () { send(s[1], []); });
+      b.appendChild(document.createTextNode(s.text));
+      b.addEventListener('click', function () { send(s.text, []); });
       grid.appendChild(b);
     });
-    hero.appendChild(mark); hero.appendChild(h2); hero.appendChild(p); hero.appendChild(grid);
+    hero.appendChild(art); hero.appendChild(mark); hero.appendChild(h2); hero.appendChild(p); hero.appendChild(grid);
     messagesEl.appendChild(hero);
   }
   function renderStored(m) {
@@ -276,14 +280,24 @@
       return;
     }
     convsCache.forEach(function (c) {
-      var item = document.createElement('button');
-      item.type = 'button';
+      var item = document.createElement('div');
+      item.setAttribute('role', 'button');
+      item.tabIndex = 0;
       item.className = 'conv-item' + (c.id === convId ? ' active' : '');
       var title = document.createElement('span');
       title.className = 'conv-title';
       title.textContent = c.title;
+      var pen = document.createElement('span');
+      pen.className = 'conv-act conv-pen';
+      pen.setAttribute('role', 'button');
+      pen.setAttribute('aria-label', '重命名这条聊天');
+      pen.innerHTML = PEN_SVG;
+      pen.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        startRename(c, item, title);
+      });
       var del = document.createElement('span');
-      del.className = 'conv-del';
+      del.className = 'conv-act conv-del';
       del.setAttribute('role', 'button');
       del.setAttribute('aria-label', '删除这条聊天');
       del.innerHTML = TRASH_SVG;
@@ -291,13 +305,57 @@
         ev.stopPropagation();
         deleteConversation(c.id);
       });
-      item.appendChild(title); item.appendChild(del);
-      item.addEventListener('click', function () {
+      item.appendChild(title); item.appendChild(pen); item.appendChild(del);
+      function activate() {
         closeDrawer();
         if (c.id !== convId) openConversation(c.id);
+      }
+      item.addEventListener('click', activate);
+      item.addEventListener('keydown', function (ev) {
+        if (ev.target !== item) return;
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); activate(); }
       });
       convListEl.appendChild(item);
     });
+  }
+  function startRename(c, item, titleEl) {
+    if (item.querySelector('.rename-input')) return;
+    var input = document.createElement('input');
+    input.className = 'rename-input';
+    input.value = c.title;
+    input.maxLength = 40;
+    input.setAttribute('aria-label', '聊天新名称');
+    titleEl.replaceWith(input);
+    item.classList.add('renaming');
+    input.focus();
+    input.select();
+    var done = false;
+    function finish(commit) {
+      if (done) return;
+      done = true;
+      var val = input.value.trim();
+      input.replaceWith(titleEl);
+      item.classList.remove('renaming');
+      if (!commit || !val || val === c.title) { renderConversations(); return; }
+      fetch('api/conversations/' + c.id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: val })
+      }).then(function (r) {
+        if (r.status === 409) { alert('当前聊天正在生成回复，请稍后再重命名'); renderConversations(); return; }
+        if (!r.ok) { alert('重命名失败（' + r.status + '）'); renderConversations(); return; }
+        c.title = val;
+        if (c.id === convId) convTitleEl.textContent = val;
+        renderConversations();
+      }).catch(function () { renderConversations(); });
+    }
+    input.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    input.addEventListener('keydown', function (ev) {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', function () { finish(true); });
   }
   async function deleteConversation(cid) {
     if (!confirm('删除这条聊天记录？')) return;

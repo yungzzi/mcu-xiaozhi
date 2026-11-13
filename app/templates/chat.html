@@ -74,5 +74,6 @@
 </div>
 {% endblock %}
 {% block scripts %}
+<script id="opening-data" type="application/json">{{ opening|tojson }}</script>
 <script src="{{ url_for('static', path='chat.js') }}"></script>
 {% endblock %}

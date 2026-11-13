@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -17,6 +18,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from .auth import COOKIE_NAME
 from .coze import ChatRequest, CozeError
 from .db import now
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
 def sse(event: str, data: dict) -> str:
@@ -89,7 +92,8 @@ def register_chat_routes(app):
         session = session_of(request)
         if session is None:
             return login_redirect()
-        return templates.TemplateResponse(request, "chat.html", {})
+        opening = json.loads((BASE_DIR / "opening.json").read_text(encoding="utf-8"))
+        return templates.TemplateResponse(request, "chat.html", {"opening": opening})
 
     @app.get("/history", name="history_page")
     def history_page(request: Request):
@@ -165,6 +169,39 @@ def register_chat_routes(app):
         finally:
             lock.release()
         return {"ok": True}
+
+    @app.patch("/api/conversations/{cid}")
+    async def rename_conversation(request: Request, cid: int):
+        session = session_of(request)
+        if session is None:
+            return unauthorized()
+        if owned_conv(session, cid) is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "bad_json"}, status_code=400)
+        title = body.get("title") if isinstance(body, dict) else None
+        if not isinstance(title, str):
+            return JSONResponse({"error": "bad_title"}, status_code=400)
+        title = title.strip()
+        if not title or len(title) > 40:
+            return JSONResponse({"error": "bad_title", "message": "名称需为 1–40 个字符"}, status_code=400)
+        # 与发送/删除共用会话锁，避免生成中自动标题与重命名互相覆盖
+        lock = locks.setdefault(cid, asyncio.Lock())
+        if lock.locked():
+            return JSONResponse({"error": "busy", "message": "当前聊天正在生成回复，请稍候再重命名"}, status_code=409)
+        await lock.acquire()
+        try:
+            if owned_conv(session, cid) is None:
+                return JSONResponse({"error": "not_found"}, status_code=404)
+            db.execute(
+                "UPDATE conversations SET title=? WHERE id=? AND token_hash=?",
+                (title, cid, session["token_hash"]),
+            )
+        finally:
+            lock.release()
+        return {"id": cid, "title": title}
 
     @app.post("/api/conversations/{cid}/send")
     async def send_message(request: Request, cid: int):

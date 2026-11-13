@@ -37,6 +37,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -98,24 +99,15 @@ a { color: var(--maroon); }
 }
 .login-photo img {
   display: block; width: 100%;
-  height: clamp(150px, 25vh, 225px);
+  height: clamp(160px, 28vh, 250px);
   object-fit: contain;
 }
-.login-photo figcaption {
-  display: flex; align-items: center; justify-content: center; gap: 7px;
-  padding: 7px 12px 9px;
-  font-size: .7rem; letter-spacing: .1em; color: var(--muted);
-  background: var(--card);
-}
-.cap-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gold); }
-.login-body { padding: 24px 30px 22px; }
-.login-brand { display: flex; gap: 14px; align-items: center; }
+.login-body { padding: 24px 30px 26px; }
+.login-brand { display: flex; gap: 14px; align-items: center; margin-bottom: 18px; }
 .login-titles h1 {
   margin: 0; font-family: var(--serif);
   font-size: 1.7rem; letter-spacing: .06em; color: var(--maroon);
 }
-.login-titles p { margin: 3px 0 0; font-size: .8rem; color: var(--muted); letter-spacing: .12em; }
-.login-lede { margin: 18px 0 4px; font-size: .88rem; color: var(--ink-2); line-height: 1.65; }
 .login-error {
   margin: 12px 0 0; padding: 9px 12px;
   background: var(--red-bg); border: 1px solid #ecc8c2; border-radius: 10px;
@@ -167,7 +159,6 @@ a { color: var(--maroon); }
 }
 .login-submit:hover { filter: brightness(1.07); box-shadow: var(--shadow-2); transform: translateY(-1px); }
 .login-submit:active { transform: translateY(0); }
-.login-foot { margin: 18px 0 0; text-align: center; font-size: .74rem; color: var(--muted); }
 
 /* ---------------- 聊天主布局 ---------------- */
 .chat-page { height: 100vh; overflow: hidden; }
@@ -201,25 +192,35 @@ a { color: var(--maroon); }
 .conv-list { flex: 1; overflow-y: auto; padding: 0 10px 10px; }
 .conv-item {
   position: relative;
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 6px;
   width: 100%;
   padding: 10px 12px;
   border: 0; border-radius: 10px;
   background: transparent; text-align: left;
   font-size: .87rem; color: var(--ink-2);
+  cursor: pointer; user-select: none;
   transition: background .14s;
 }
 .conv-item:hover { background: var(--paper-2); }
 .conv-item.active { background: var(--maroon-bg); color: var(--maroon-deep); font-weight: 600; }
 .conv-item .conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conv-item .conv-del {
+.conv-item .conv-act {
   flex: none; width: 26px; height: 26px;
   display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: 7px; background: transparent; color: var(--muted);
   opacity: 0; transition: opacity .14s, background .14s, color .14s;
 }
-.conv-item:hover .conv-del, .conv-item.active .conv-del { opacity: 1; }
+.conv-item:hover .conv-act, .conv-item.active .conv-act, .conv-item.renaming .conv-act { opacity: 1; }
 .conv-item .conv-del:hover { background: var(--red-bg); color: var(--red); }
+.conv-item .conv-pen:hover { background: var(--amber-bg); color: var(--gold-deep); }
+.rename-input {
+  flex: 1; min-width: 0;
+  border: 1px solid var(--maroon-2); border-radius: 7px;
+  background: #fff; color: var(--ink);
+  font-size: .85rem; padding: 5px 8px; outline: none;
+  box-shadow: 0 0 0 3px rgba(166, 58, 66, .13);
+}
+.page-rename { max-width: 320px; }
 .conv-empty { padding: 14px 12px; font-size: .8rem; color: var(--muted); }
 .side-foot { border-top: 1px solid var(--line); padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
 .side-link {
@@ -243,8 +244,9 @@ a { color: var(--maroon); }
   display: flex; flex-direction: column;
   position: relative;
   background:
-    linear-gradient(rgba(246, 241, 232, .90), rgba(246, 241, 232, .93)),
-    url("chat-bg.jpg") center bottom / contain no-repeat;
+    radial-gradient(800px 400px at 100% 0%, rgba(201, 160, 99, .07), transparent 60%),
+    linear-gradient(rgba(246, 241, 232, .6), rgba(246, 241, 232, .9)),
+    var(--paper);
 }
 .chat-head {
   display: flex; align-items: center; gap: 12px;
@@ -390,7 +392,7 @@ pre.code {
   margin: 0 0 20px;
   border: 1px solid var(--line);
   border-radius: 16px;
-  background: #f6efe4;
+  background: #f1e9dc;
   box-shadow: var(--shadow-1);
   overflow: hidden;
 }
@@ -403,6 +405,12 @@ pre.code {
 .empty-hero .brand-mark svg { width: 32px; height: 32px; }
 .empty-hero h2 { font-family: var(--serif); font-size: 1.55rem; color: var(--maroon); margin: 0 0 8px; letter-spacing: .05em; }
 .empty-hero p { color: var(--ink-2); font-size: .9rem; margin: 0 0 24px; line-height: 1.7; }
+.empty-hero .opening-text {
+  max-width: 480px; margin-left: auto; margin-right: auto;
+  background: rgba(255, 253, 249, .85);
+  border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px 16px;
+}
 .suggest-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 11px; }
 .suggest {
   border: 1px solid var(--line); border-radius: 12px;
@@ -487,8 +495,8 @@ pre.code {
 .history-page, .account-page {
   min-height: 100vh;
   background:
-    linear-gradient(rgba(246, 241, 232, .95), rgba(246, 241, 232, .97)),
-    url("chat-bg.jpg") center bottom / contain no-repeat;
+    radial-gradient(800px 400px at 100% 0%, rgba(201, 160, 99, .08), transparent 60%),
+    var(--paper);
 }
 .page-shell { max-width: 760px; margin: 0 auto; padding: 30px 18px 50px; }
 .page-shell.narrow { max-width: 560px; }
@@ -528,6 +536,13 @@ pre.code {
   transition: all .14s;
 }
 .del-conv:hover { background: var(--red-bg); color: var(--red); }
+.rename-conv {
+  flex: none; width: 32px; height: 32px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 8px; background: transparent; color: var(--muted);
+  transition: all .14s;
+}
+.rename-conv:hover { background: var(--amber-bg); color: var(--gold-deep); }
 .empty-note { text-align: center; color: var(--muted); padding: 36px 10px; }
 .empty-note p { font-size: .85rem; }
 .account-row { display: flex; gap: 14px; align-items: center; padding: 14px 8px; }
