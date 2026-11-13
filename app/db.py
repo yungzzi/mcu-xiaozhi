@@ -7,6 +7,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA = """
@@ -100,70 +101,64 @@ class Database:
                     if self._conn.in_transaction:
                         self._conn.execute("ROLLBACK")
                     raise
-            # 幂等迁移：历史归属从登录会话改为账号（跨设备共享历史）。
-            # 单共享账号应用：全部旧数据归属该账号；附件记录相对存储路径。
-            # 扣子上下文的保留/找回在下一个迁移块处理。与补列同一事务。
-            conv_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
+            # 幂等迁移：账号归属 + 扣子上下文映射必须在同一事务内（审阅 P1）：
+            # 若分两次提交、期间中断，重启会因 user_id 已存在而把 0.1.3 旧库
+            # 误判为 0.2.x 谱系，跳过旧身份缺失时的重建标记。
+            # - 归属：单共享账号应用，全部旧数据归属该账号；附件记录相对路径
+            # - 上下文：每条聊天保存调用扣子使用的 coze_user_id；在 sessions
+            #   归一化之前（AuthService 在本迁移之后初始化）用 token_hash 找回
+            #   旧登录身份。可找回→保留旧 ID 对续聊；找不回→旧会话 ID 存 legacy
+            #   作记录并标记 context_restore（首次续问用近期问答重建）
             att_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(attachments)")}
-            if "user_id" not in conv_cols or "user_id" not in att_cols or "stored_path" not in att_cols:
+            need_account = ("user_id" not in cols or "user_id" not in att_cols
+                            or "stored_path" not in att_cols)
+            need_context = ("coze_user_id" not in cols or "context_restore" not in cols
+                            or "legacy_coze_conversation_id" not in cols)
+            if need_account or need_context:
                 try:
                     self._conn.execute("BEGIN IMMEDIATE")
-                    if "user_id" not in conv_cols:
-                        self._conn.execute("ALTER TABLE conversations ADD COLUMN user_id INTEGER")
-                    if "user_id" not in att_cols:
-                        self._conn.execute("ALTER TABLE attachments ADD COLUMN user_id INTEGER")
-                    if "stored_path" not in att_cols:
-                        self._conn.execute("ALTER TABLE attachments ADD COLUMN stored_path TEXT")
-                    self._conn.execute(
-                        "UPDATE conversations SET user_id=(SELECT id FROM users ORDER BY id LIMIT 1)"
-                        " WHERE user_id IS NULL"
-                    )
-                    self._conn.execute(
-                        "UPDATE attachments SET user_id=(SELECT id FROM users ORDER BY id LIMIT 1)"
-                        " WHERE user_id IS NULL"
-                    )
-                    self._conn.execute(
-                        "UPDATE attachments SET stored_path=substr(token_hash,1,16) || '/' || stored_name"
-                        " WHERE stored_path IS NULL"
-                    )
-                    self._conn.execute("COMMIT")
-                except BaseException:
-                    if self._conn.in_transaction:
-                        self._conn.execute("ROLLBACK")
-                    raise
-            # 幂等迁移：扣子上下文跟聊天走（审阅调整）。每条聊天保存调用扣子
-            # 使用的 coze_user_id；在 sessions 归一化之前（AuthService 在本迁移
-            # 之后初始化），用旧聊天的 token_hash 找回旧登录的扣子身份：
-            # - 可找回：保留旧 (coze_user_id, coze_conversation_id) 对，续用原会话
-            # - 找不回（旧登录已退出/过期/改密删除）：旧会话 ID 存入 legacy 作迁移
-            #   记录，标记 context_restore，首次续问用近期问答重建上下文
-            conv_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
-            if ("coze_user_id" not in conv_cols or "context_restore" not in conv_cols
-                    or "legacy_coze_conversation_id" not in conv_cols):
-                try:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    if "coze_user_id" not in conv_cols:
-                        self._conn.execute("ALTER TABLE conversations ADD COLUMN coze_user_id TEXT")
-                    if "context_restore" not in conv_cols:
+                    if need_account:
+                        if "user_id" not in cols:
+                            self._conn.execute("ALTER TABLE conversations ADD COLUMN user_id INTEGER")
+                        if "user_id" not in att_cols:
+                            self._conn.execute("ALTER TABLE attachments ADD COLUMN user_id INTEGER")
+                        if "stored_path" not in att_cols:
+                            self._conn.execute("ALTER TABLE attachments ADD COLUMN stored_path TEXT")
                         self._conn.execute(
-                            "ALTER TABLE conversations ADD COLUMN context_restore INTEGER NOT NULL DEFAULT 0")
-                    if "legacy_coze_conversation_id" not in conv_cols:
-                        self._conn.execute(
-                            "ALTER TABLE conversations ADD COLUMN legacy_coze_conversation_id TEXT")
-                    self._conn.execute(
-                        "UPDATE conversations SET coze_user_id=("
-                        " SELECT s.coze_user_id FROM sessions s WHERE s.token_hash=conversations.token_hash)"
-                        " WHERE coze_user_id IS NULL AND coze_conversation_id IS NOT NULL"
-                        " AND EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash=conversations.token_hash)"
-                    )
-                    if not had_account_migration:
-                        # 仅 0.1.3 直升级路径：旧身份找不回才标记重建。
-                        # 0.2.x 谱系的上下文本就账号级，coze_user_id 留空回落即可。
-                        self._conn.execute(
-                            "UPDATE conversations SET legacy_coze_conversation_id=coze_conversation_id,"
-                            " coze_conversation_id=NULL, context_restore=1"
-                            " WHERE coze_user_id IS NULL AND coze_conversation_id IS NOT NULL"
+                            "UPDATE conversations SET user_id=(SELECT id FROM users ORDER BY id LIMIT 1)"
+                            " WHERE user_id IS NULL"
                         )
+                        self._conn.execute(
+                            "UPDATE attachments SET user_id=(SELECT id FROM users ORDER BY id LIMIT 1)"
+                            " WHERE user_id IS NULL"
+                        )
+                        self._conn.execute(
+                            "UPDATE attachments SET stored_path=substr(token_hash,1,16) || '/' || stored_name"
+                            " WHERE stored_path IS NULL"
+                        )
+                    if need_context:
+                        if "coze_user_id" not in cols:
+                            self._conn.execute("ALTER TABLE conversations ADD COLUMN coze_user_id TEXT")
+                        if "context_restore" not in cols:
+                            self._conn.execute(
+                                "ALTER TABLE conversations ADD COLUMN context_restore INTEGER NOT NULL DEFAULT 0")
+                        if "legacy_coze_conversation_id" not in cols:
+                            self._conn.execute(
+                                "ALTER TABLE conversations ADD COLUMN legacy_coze_conversation_id TEXT")
+                        self._conn.execute(
+                            "UPDATE conversations SET coze_user_id=("
+                            " SELECT s.coze_user_id FROM sessions s WHERE s.token_hash=conversations.token_hash)"
+                            " WHERE coze_user_id IS NULL AND coze_conversation_id IS NOT NULL"
+                            " AND EXISTS (SELECT 1 FROM sessions s WHERE s.token_hash=conversations.token_hash)"
+                        )
+                        if not had_account_migration:
+                            # 仅 0.1.3 直升级路径：旧身份找不回才标记重建。
+                            # 0.2.x 谱系的上下文本就账号级，coze_user_id 留空回落即可。
+                            self._conn.execute(
+                                "UPDATE conversations SET legacy_coze_conversation_id=coze_conversation_id,"
+                                " coze_conversation_id=NULL, context_restore=1"
+                                " WHERE coze_user_id IS NULL AND coze_conversation_id IS NOT NULL"
+                            )
                     self._conn.execute("COMMIT")
                 except BaseException:
                     if self._conn.in_transaction:
@@ -176,6 +171,21 @@ class Database:
             cur = self._conn.execute(sql, params)
             self._conn.commit()
             return cur
+
+    @contextmanager
+    def transaction(self):
+        """显式事务：yield 原生连接供调用方直接执行 SQL，成功整体提交、
+        失败整体回滚（用于回复入库+映射切换等原子写入，审阅建议）。
+        注意：事务内不要再调用 execute/query（会重复取锁）。"""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:

@@ -27,6 +27,7 @@ class ChatRequest:
     conversation_id: str | None  # None = 新会话；之后复用首次返回值
     text: str
     file_ids: list[str] | None = None  # 图文问答时携带
+    history: list | None = None  # 上下文重建：带 role 的近期成功问答对，经 additional_messages 发送
 
 
 def get_client(settings):

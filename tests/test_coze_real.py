@@ -71,7 +71,14 @@ SCENARIOS = {
         ev("conversation.chat.failed", {"code": 40003, "msg": "conversation not found or no permission"}),
         DONE,
     ],
+    "conv_invalid_code": [
+        # 官方错误码 4002 = invalid conversation；msg 无关键字，验证码优先判定
+        ev("conversation.chat.failed", {"code": 4002, "msg": "bad request"}),
+        DONE,
+    ],
 }
+
+LAST_PAYLOAD: dict = {}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -84,7 +91,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(length)
+        raw = self.rfile.read(length)
+        if self.path.startswith("/v3/chat"):
+            LAST_PAYLOAD.clear()
+            try:
+                LAST_PAYLOAD.update(json.loads(raw))
+            except ValueError:
+                pass
         name = self._scenario()
         if self.path.startswith("/v1/files/upload"):
             if name == "upload-fail":
@@ -202,6 +215,40 @@ def test_conversation_invalid_classified(server):
     """扣子明确判定会话不存在/不可访问 → conversation_invalid（触发重建流程）。"""
     exc = expect_error(make_client(server, "conv_invalid"), "conversation_invalid")
     assert exc.code == 40003
+
+
+def test_conversation_invalid_official_code_first(server):
+    """官方错误码 4002 优先判定（msg 无关键字也成立）。"""
+    exc = expect_error(make_client(server, "conv_invalid_code"), "conversation_invalid")
+    assert exc.code == 4002
+
+
+def test_history_sent_as_role_messages(server):
+    """审阅 P2：重建历史经 additional_messages 带 role 发送，最后一条是本次问题。"""
+    client = make_client(server, "ok")
+
+    async def run():
+        events = []
+        try:
+            req = ChatRequest(
+                user_id="u1", conversation_id=None, text="新问题",
+                history=[{"role": "user", "content": "旧问"},
+                         {"role": "assistant", "content": "旧答"}],
+            )
+            async for e in client.stream_chat(req):
+                events.append(e)
+        finally:
+            await client.aclose()
+        return events
+
+    events = asyncio.run(run())
+    assert events[-1]["type"] == "done"
+    msgs = LAST_PAYLOAD["additional_messages"]
+    assert msgs == [
+        {"role": "user", "content": "旧问", "content_type": "text"},
+        {"role": "assistant", "content": "旧答", "content_type": "text"},
+        {"role": "user", "content": "新问题", "content_type": "text"},
+    ]
 
 
 def test_http_401_auth(server):

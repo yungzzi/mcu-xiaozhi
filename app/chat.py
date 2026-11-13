@@ -26,37 +26,38 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def build_restore_prefix(db, cid: int) -> str:
-    """旧扣子身份找不回时，用近期成功问答重建上下文（审阅调整）。
+def build_restore_history(db, cid: int) -> list[dict]:
+    """旧扣子身份找不回时，用近期成功问答对重建上下文（审阅调整）。
 
-    只取「成功的问答对」：assistant 必须 status=ok，user 必须有其后的 ok 回答
-    （失败轮次的问题与当前尚未回答的问题都不带入）。按时间顺序拼接，
-    最多 20 条、单条截断 1000 字。仅作为本次 /v3/chat 请求文本的前缀，
-    不入库、不改动站点历史。
+    先组成完整的成功问答对（ok 回答 + 其前对应的 ok 用户问题），再按对数
+    截取（最多 10 对，单条截断 1000 字）；孤立回答、失败轮次、当前尚未
+    回答的问题都不带入。返回带 role 的消息列表，经 additional_messages
+    发送，不拼成一条用户消息。
     """
     rows = db.query(
-        "SELECT role, content, status FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 60",
+        "SELECT role, content, status FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 120",
         (cid,),
     )
-    parts: list[str] = []
-    answered = False
+    pairs: list[tuple[str, str]] = []
+    pending_answer: str | None = None
     for r in rows:  # 从最新往回配对
         if r["role"] == "assistant" and r["status"] == "ok":
-            parts.append("助手：" + r["content"][:1000])
-            answered = True
-        elif r["role"] == "user" and r["status"] == "ok" and answered:
-            parts.append("用户：" + r["content"][:1000])
-            answered = False
-        if len(parts) >= 20:
-            break
-    if not parts:
-        return ""
-    parts.reverse()
-    return (
-        "【以下是本聊天此前的对话记录（节选），用于恢复上下文，请勿重复回答】\n"
-        + "\n".join(parts)
-        + "\n【对话记录结束，请回答最新问题】\n"
-    )
+            # 连续出现多条回答时，较新的孤立回答被覆盖丢弃，
+            # 问题只与其紧邻其后的回答配对
+            pending_answer = r["content"][:1000]
+        elif r["role"] == "assistant":
+            pending_answer = None  # 失败/中断的回答断开配对链
+        elif r["role"] == "user" and r["status"] == "ok" and pending_answer is not None:
+            pairs.append((r["content"][:1000], pending_answer))
+            pending_answer = None
+            if len(pairs) >= 10:
+                break
+    pairs.reverse()
+    history: list[dict] = []
+    for q, a in pairs:
+        history.append({"role": "user", "content": q})
+        history.append({"role": "assistant", "content": a})
+    return history
 
 
 class _LockGuard:
@@ -290,6 +291,12 @@ def register_chat_routes(app):
                 return JSONResponse({"error": "not_found"}, status_code=404)
             conv = conv_now
 
+            # 恢复历史读取也在释放保护内、且在写入本次用户消息之前
+            # （审阅 P1：查询失败必须释放锁，不能占锁到 409）
+            restore_history: list[dict] = []
+            if conv["context_restore"]:
+                restore_history = build_restore_history(db, cid)
+
             file_ids = []
             link_ids = []  # 将关联到新消息的附件行 id
             for aid in attachment_ids:
@@ -341,11 +348,6 @@ def register_chat_routes(app):
         coze_user_id = conv["coze_user_id"] or session["coze_user_id"]
         conv_created = conv["created_at"]
         restore = bool(conv["context_restore"])
-        send_text = text
-        if restore:
-            prefix = build_restore_prefix(db, cid)
-            if prefix:
-                send_text = prefix + "\n" + text
 
         def conv_alive() -> bool:
             # 写入时校验：会话仍存在、归属一致、且是本轮开始时的同一会话
@@ -377,8 +379,9 @@ def register_chat_routes(app):
                 ChatRequest(
                     user_id=coze_user_id,
                     conversation_id=coze_conv_id,
-                    text=send_text,
+                    text=text,
                     file_ids=file_ids or None,
+                    history=restore_history or None,
                 )
             )
             try:
@@ -400,15 +403,30 @@ def register_chat_routes(app):
                         content = ev["content"]
                 if content is None:
                     content = "".join(acc)
-                msg_id = save_assistant(content, "ok")
+                if restore and coze_conv_id:
+                    # 恢复模式：最终回复入库 + 映射切换放同一事务（审阅建议），
+                    # 避免回复已存为成功而映射更新失败、下次重复恢复。
+                    msg_id = -1
+                    if conv_alive():
+                        with db.transaction() as conn:
+                            cur = conn.execute(
+                                "INSERT INTO messages(conversation_id, role, content, status, created_at)"
+                                " VALUES(?,?,?,?,?)",
+                                (cid, "assistant", content, "ok", now()),
+                            )
+                            msg_id = cur.lastrowid
+                            conn.execute(
+                                "UPDATE conversations SET updated_at=? WHERE id=? AND user_id=? AND created_at=?",
+                                (now(), cid, user_id, conv_created),
+                            )
+                            conn.execute(
+                                "UPDATE conversations SET coze_conversation_id=?, coze_user_id=?, context_restore=0"
+                                " WHERE id=? AND user_id=? AND created_at=?",
+                                (coze_conv_id, coze_user_id, cid, user_id, conv_created),
+                            )
+                else:
+                    msg_id = save_assistant(content, "ok")
                 saved = True
-                if restore and msg_id != -1 and coze_conv_id:
-                    # 整轮成功：切换到新会话映射，之后只发新问题
-                    db.execute(
-                        "UPDATE conversations SET coze_conversation_id=?, coze_user_id=?, context_restore=0"
-                        " WHERE id=? AND user_id=? AND created_at=?",
-                        (coze_conv_id, coze_user_id, cid, user_id, conv_created),
-                    )
                 yield sse("done", {"message_id": msg_id, "content": content, "status": "ok"})
             except CozeError as exc:
                 content = "".join(acc)

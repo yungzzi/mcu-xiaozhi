@@ -11,9 +11,10 @@
 """
 import sqlite3
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.auth import hash_password, token_hash
+from app.auth import COOKIE_NAME, hash_password, token_hash
 from app.coze.base import CozeError
 from app.main import create_app
 from conftest import PASSWORD, login
@@ -205,8 +206,9 @@ def test_old_db_upgrade_unrecoverable_restores_context(settings):
         assert parse_sse(r.text)[-1][0] == "done"
         call = app.state.coze.calls[-1]
         assert call.conversation_id is None
-        assert "旧问题" in call.text and "旧回答" in call.text
-        assert call.text.endswith("重建后的新问题")
+        assert call.text == "重建后的新问题"
+        assert {"role": "user", "content": "旧问题"} in call.history
+        assert {"role": "assistant", "content": "旧回答"} in call.history
         assert call.user_id.startswith("mcu-") and call.user_id != "mcu-oldrandom"
         # 整轮成功：切换到新映射，清除标记；用户消息入库仍为原文
         row = app.state.db.query_one(
@@ -217,10 +219,11 @@ def test_old_db_upgrade_unrecoverable_restores_context(settings):
         assert row["coze_user_id"] == call.user_id
         msgs = c.get(f"/api/conversations/{cid}/messages").json()["messages"]
         assert msgs[-2]["content"] == "重建后的新问题"
-        # 之后只发新问题
+        # 之后只发新问题（不带历史）
         r = c.post(f"/api/conversations/{cid}/send", json={"text": "再追问"})
         assert parse_sse(r.text)[-1][0] == "done"
         assert app.state.coze.calls[-1].text == "再追问"
+        assert not app.state.coze.calls[-1].history
         assert app.state.coze.calls[-1].conversation_id is not None
 
 
@@ -243,7 +246,8 @@ def test_restore_failure_keeps_flag_and_retries(settings):
         r = c.post(f"/api/conversations/{cid}/send", json={"text": "重试的问题"})
         assert parse_sse(r.text)[-1][0] == "done"
         call = app.state.coze.calls[-1]
-        assert "旧问题" in call.text and "重试的问题" in call.text
+        assert call.text == "重试的问题"
+        assert {"role": "user", "content": "旧问题"} in call.history
         row = app.state.db.query_one(
             "SELECT context_restore, coze_conversation_id FROM conversations WHERE id=?", (cid,))
         assert row["context_restore"] == 0
@@ -293,7 +297,8 @@ def test_conversation_invalid_triggers_rebuild(app):
         r = c.post(f"/api/conversations/{cid}/send", json={"text": "第三问"})
         assert parse_sse(r.text)[-1][0] == "done"
         call = app.state.coze.calls[-1]
-        assert "第一问" in call.text and "第三问" in call.text
+        assert call.text == "第三问"
+        assert {"role": "user", "content": "第一问"} in call.history
         row = app.state.db.query_one(
             "SELECT context_restore, coze_conversation_id FROM conversations WHERE id=?", (cid,))
         assert row["context_restore"] == 0
@@ -362,6 +367,140 @@ def test_02x_lineage_keeps_context_without_restore(tmp_path):
         assert r2["context_restore"] == 0
     finally:
         db.close()
+
+
+def test_restore_history_query_failure_releases_lock(settings):
+    """审阅 P1 回归：恢复历史查询失败 → 500 但锁释放，恢复后可正常重发。"""
+    _make_full_old_db(settings, with_session=False)
+    app = create_app(settings)
+    with TestClient(app) as c:
+        login(c)
+        cid = c.get("/api/conversations").json()[0]["id"]
+        original = app.state.db.query
+
+        def flaky(sql, params=()):
+            if sql.startswith("SELECT role, content, status FROM messages"):
+                raise sqlite3.OperationalError("simulated restore query failure")
+            return original(sql, params)
+
+        app.state.db.query = flaky
+        try:
+            with TestClient(app, raise_server_exceptions=False) as c2:
+                c2.cookies.set(COOKIE_NAME, c.cookies.get(COOKIE_NAME))
+                r = c2.post(f"/api/conversations/{cid}/send", json={"text": "恢复查询失败"})
+                assert r.status_code == 500
+        finally:
+            app.state.db.query = original
+        assert not app.state.chat_locks[cid].locked(), "查询失败后锁必须释放"
+        r = c.post(f"/api/conversations/{cid}/send", json={"text": "恢复后的正常发送"})
+        assert parse_sse(r.text)[-1][0] == "done"
+
+
+def test_migration_interrupted_rolls_back_both_phases(settings):
+    """审阅 P1 回归：归属与上下文迁移同一事务——上下文阶段中断时
+    user_id 补列也回滚，重启不会把 0.1.3 旧库误判为 0.2.x 谱系。"""
+    _make_full_old_db(settings, with_session=False)
+    conn = sqlite3.connect(str(settings.db_path))
+    conn.execute("""
+        CREATE TRIGGER fail_context BEFORE UPDATE ON conversations
+        WHEN NEW.context_restore = 1 AND OLD.context_restore = 0
+        BEGIN SELECT RAISE(ABORT, 'simulated interruption'); END;
+    """)
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.Error):
+        create_app(settings)
+    conn = sqlite3.connect(str(settings.db_path))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+    assert "user_id" not in cols, "归属阶段必须随上下文阶段一起回滚"
+    assert "coze_user_id" not in cols
+    conn.execute("DROP TRIGGER fail_context")
+    conn.commit()
+    conn.close()
+
+    app = create_app(settings)  # 重启完整重做，谱系仍判定为 0.1.3
+    with TestClient(app) as c:
+        login(c)
+        cid = c.get("/api/conversations").json()[0]["id"]
+        row = app.state.db.query_one(
+            "SELECT context_restore, legacy_coze_conversation_id FROM conversations WHERE id=?", (cid,))
+        assert row["context_restore"] == 1
+        assert row["legacy_coze_conversation_id"] == "old-coze-conv"
+
+
+def test_restore_history_complete_pairs_only(app):
+    """审阅 P2 回归：按完整问答对截取——孤立回答不带入、按对数截断、
+    当前未答问题不带入。"""
+    from app.chat import build_restore_history
+
+    db = app.state.db
+    db.execute(
+        "INSERT INTO conversations(id, token_hash, user_id, title, created_at, updated_at)"
+        " VALUES(900,'x',1,'配对测试',1,1)")
+    # 12 轮成功问答（旧→新）
+    for i in range(12):
+        db.execute("INSERT INTO messages(conversation_id, role, content, status, created_at)"
+                   " VALUES(900,'user',?, 'ok', 1)", (f"问{i}",))
+        db.execute("INSERT INTO messages(conversation_id, role, content, status, created_at)"
+                   " VALUES(900,'assistant',?, 'ok', 1)", (f"答{i}",))
+    # 一条孤立回答（无对应问题）+ 当前尚未回答的问题
+    db.execute("INSERT INTO messages(conversation_id, role, content, status, created_at)"
+               " VALUES(900,'assistant','孤立回答','ok',1)")
+    db.execute("INSERT INTO messages(conversation_id, role, content, status, created_at)"
+               " VALUES(900,'user','当前问题','ok',1)")
+
+    history = build_restore_history(db, 900)
+    assert len(history) == 20  # 最多 10 对
+    # 按时间正序（最旧在前），供 additional_messages 顺序发送
+    assert history[0] == {"role": "user", "content": "问2"}
+    assert history[1] == {"role": "assistant", "content": "答2"}
+    assert history[-2] == {"role": "user", "content": "问11"}
+    assert history[-1] == {"role": "assistant", "content": "答11"}
+    assert all("孤立回答" not in m["content"] for m in history)
+    assert all("当前问题" not in m["content"] for m in history)
+
+
+def test_atomic_switch_failure_keeps_restore(settings):
+    """审阅建议回归：回复入库+映射切换同一事务——切换失败时回复不得
+    存为 ok，标记保留，下次仍带历史重建。"""
+    _make_full_old_db(settings, with_session=False)
+    app = create_app(settings)
+    with TestClient(app) as c:
+        login(c)
+        cid = c.get("/api/conversations").json()[0]["id"]
+        conn = sqlite3.connect(str(settings.db_path))
+        conn.execute("""
+            CREATE TRIGGER fail_switch BEFORE UPDATE ON conversations
+            WHEN NEW.context_restore = 0 AND OLD.context_restore = 1
+            BEGIN SELECT RAISE(ABORT, 'simulated switch failure'); END;
+        """)
+        conn.commit()
+        conn.close()
+
+        r = c.post(f"/api/conversations/{cid}/send", json={"text": "切换失败的问题"})
+        assert parse_sse(r.text)[-1][0] == "error"
+        rows = app.state.db.query(
+            "SELECT status FROM messages WHERE conversation_id=? AND role='assistant' ORDER BY id", (cid,))
+        # 旧历史的 ok 回答仍在；本轮新回复不得存为 ok（事务已回滚，仅留 other 记录）
+        assert rows[-1]["status"] != "ok", "切换失败时本轮回复不得存为成功"
+        assert sum(1 for x in rows if x["status"] == "ok") == 1  # 仅旧回答
+        row = app.state.db.query_one(
+            "SELECT context_restore FROM conversations WHERE id=?", (cid,))
+        assert row["context_restore"] == 1
+
+        conn = sqlite3.connect(str(settings.db_path))
+        conn.execute("DROP TRIGGER fail_switch")
+        conn.commit()
+        conn.close()
+        r = c.post(f"/api/conversations/{cid}/send", json={"text": "重试切换"})
+        assert parse_sse(r.text)[-1][0] == "done"
+        call = app.state.coze.calls[-1]
+        assert {"role": "user", "content": "旧问题"} in call.history
+        row = app.state.db.query_one(
+            "SELECT context_restore, coze_conversation_id FROM conversations WHERE id=?", (cid,))
+        assert row["context_restore"] == 0
+        assert row["coze_conversation_id"] is not None
 
 
 def _make_backup(path, rows):
