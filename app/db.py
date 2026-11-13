@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     token_hash TEXT NOT NULL,
     coze_conversation_id TEXT,
     title TEXT NOT NULL DEFAULT '新对话',
+    auto_title INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -68,6 +69,13 @@ class Database:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # 幂等迁移：旧库补 auto_title 列（是否允许首问自动命名；
+            # 手动重命名后置 0，避免同名默认标题被首问覆盖，审阅 P2）
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(conversations)")}
+            if "auto_title" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE conversations ADD COLUMN auto_title INTEGER NOT NULL DEFAULT 1"
+                )
             self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:

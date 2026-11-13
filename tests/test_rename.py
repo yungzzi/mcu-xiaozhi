@@ -1,10 +1,14 @@
 """会话重命名回归（全 mock，0 扣子请求）。"""
 import asyncio
+import json
+import sqlite3
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.auth import COOKIE_NAME
+from app.db import Database, now
 from conftest import PASSWORD, login
 from test_chat import new_conv, parse_sse
 
@@ -89,3 +93,116 @@ def test_rename_during_generation_busy(app):
             assert r.status_code == 200
 
     asyncio.run(run())
+
+
+def test_manual_default_title_not_overwritten(auth_client):
+    """审阅 P2 回归：手动命名为与默认相同的「新对话」，首问不得覆盖。"""
+    cid = new_conv(auth_client)
+    r = auth_client.patch(f"/api/conversations/{cid}", json={"title": "新对话"})
+    assert r.status_code == 200
+    r = auth_client.post(f"/api/conversations/{cid}/send", json={"text": "第一个问题"})
+    assert parse_sse(r.text)[-1][0] == "done"
+    convs = auth_client.get("/api/conversations").json()
+    assert convs[0]["title"] == "新对话", "手动设置的同名标题被首问覆盖"
+
+
+def test_auto_title_fires_once(auth_client):
+    """自动命名只在首问发生一次，第二问不改标题。"""
+    cid = new_conv(auth_client)
+    r = auth_client.post(f"/api/conversations/{cid}/send", json={"text": "第一问的内容"})
+    assert parse_sse(r.text)[-1][0] == "done"
+    r = auth_client.post(f"/api/conversations/{cid}/send", json={"text": "第二问的内容"})
+    assert parse_sse(r.text)[-1][0] == "done"
+    convs = auth_client.get("/api/conversations").json()
+    assert convs[0]["title"] == "第一问的内容"
+
+
+def test_rename_during_body_read_id_reuse(app):
+    """审阅 P1 回归：读请求体期间旧聊天被删、同登录会话新建聊天复用 ID
+    → 旧重命名请求 404，新聊天标题保持原样，锁释放。"""
+    with TestClient(app) as c:
+        login(c)
+        cookie = c.cookies.get(COOKIE_NAME)
+        cid = c.post("/api/conversations").json()["id"]
+        token_hash = app.state.db.query_one(
+            "SELECT token_hash FROM conversations WHERE id=?", (cid,))["token_hash"]
+
+        async def run():
+            body = json.dumps({"title": "迟到的改名"}).encode()
+            path = f"/api/conversations/{cid}"
+            scope = {
+                "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1", "method": "PATCH", "scheme": "http",
+                "path": path, "raw_path": path.encode(), "query_string": b"",
+                "root_path": "",
+                "headers": [
+                    (b"cookie", f"{COOKIE_NAME}={cookie}".encode()),
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+                "client": ("127.0.0.1", 12345), "server": ("testserver", 80),
+            }
+            mutated = False
+            statuses = []
+
+            async def receive():
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    # 请求体送达前：删除旧聊天，新建聊天复用同一整数 ID
+                    app.state.db.execute("DELETE FROM conversations WHERE id=?", (cid,))
+                    app.state.db.execute(
+                        "INSERT INTO conversations(id, token_hash, title, created_at, updated_at)"
+                        " VALUES(?,?,?,?,?)",
+                        (cid, token_hash, "新对话", now() + 10, now() + 10),
+                    )
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def send(msg):
+                if msg["type"] == "http.response.start":
+                    statuses.append(msg["status"])
+
+            await app(scope, receive, send)
+            return statuses
+
+        statuses = asyncio.run(run())
+        assert statuses == [404], f"延迟重命名应被拒绝：{statuses}"
+        assert not app.state.chat_locks[cid].locked(), "重命名拒绝后锁必须释放"
+        row = app.state.db.query_one("SELECT title FROM conversations WHERE id=?", (cid,))
+        assert row["title"] == "新对话", "新聊天标题被旧请求改写"
+        # 新聊天仍可正常重命名与发送
+        r = c.patch(f"/api/conversations/{cid}", json={"title": "新聊天的名字"})
+        assert r.status_code == 200
+        r = c.post(f"/api/conversations/{cid}/send", json={"text": "新会话的问题"})
+        assert parse_sse(r.text)[-1][0] == "done"
+
+
+def test_migration_adds_auto_title(tmp_path):
+    """旧库（无 auto_title 列）启动时幂等补列，既有行默认允许自动命名。"""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE conversations (
+            id INTEGER PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            coze_conversation_id TEXT,
+            title TEXT NOT NULL DEFAULT '新对话',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+    """)
+    conn.execute(
+        "INSERT INTO conversations(token_hash, title, created_at, updated_at) VALUES('h','旧聊天',1,1)")
+    conn.commit()
+    conn.close()
+    db = Database(path)
+    try:
+        cols = {r[1] for r in db.query("PRAGMA table_info(conversations)")}
+        assert "auto_title" in cols
+        row = db.query_one("SELECT title, auto_title FROM conversations WHERE id=1")
+        assert row["title"] == "旧聊天" and row["auto_title"] == 1
+    finally:
+        db.close()
+    # 再次启动不重复加列（幂等）
+    db2 = Database(path)
+    db2.close()

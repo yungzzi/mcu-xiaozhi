@@ -175,7 +175,8 @@ def register_chat_routes(app):
         session = session_of(request)
         if session is None:
             return unauthorized()
-        if owned_conv(session, cid) is None:
+        conv = owned_conv(session, cid)
+        if conv is None:
             return JSONResponse({"error": "not_found"}, status_code=404)
         try:
             body = await request.json()
@@ -193,12 +194,19 @@ def register_chat_routes(app):
             return JSONResponse({"error": "busy", "message": "当前聊天正在生成回复，请稍候再重命名"}, status_code=409)
         await lock.acquire()
         try:
-            if owned_conv(session, cid) is None:
+            # 锁内重校验会话身份（复用发送接口的做法，审阅 P1）：
+            # 等待请求体期间旧聊天可能已被删除、整数 ID 被新聊天复用，
+            # 必须确认存在、归属一致、created_at 仍是原会话才能改名。
+            conv_now = owned_conv(session, cid)
+            if conv_now is None or conv_now["created_at"] != conv["created_at"]:
                 return JSONResponse({"error": "not_found"}, status_code=404)
-            db.execute(
-                "UPDATE conversations SET title=? WHERE id=? AND token_hash=?",
-                (title, cid, session["token_hash"]),
+            cur = db.execute(
+                "UPDATE conversations SET title=?, auto_title=0"
+                " WHERE id=? AND token_hash=? AND created_at=?",
+                (title, cid, session["token_hash"], conv["created_at"]),
             )
+            if cur.rowcount == 0:
+                return JSONResponse({"error": "not_found"}, status_code=404)
         finally:
             lock.release()
         return {"id": cid, "title": title}
@@ -278,8 +286,14 @@ def register_chat_routes(app):
             user_msg_id = user_cur.lastrowid
             for att_id in link_ids:
                 db.execute("UPDATE attachments SET message_id=? WHERE id=?", (user_msg_id, att_id))
-            if conv["title"] == "新对话" and text:
-                db.execute("UPDATE conversations SET title=? WHERE id=?", (text[:30], cid))
+            # 自动命名以 auto_title 标志为准（审阅 P2）：手动改过名（含改成
+            # 与默认相同的「新对话」）后不再被首问覆盖；自动命名一次后置 0。
+            if conv["auto_title"] and text:
+                db.execute(
+                    "UPDATE conversations SET title=?, auto_title=0"
+                    " WHERE id=? AND token_hash=? AND created_at=?",
+                    (text[:30], cid, session["token_hash"], conv["created_at"]),
+                )
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
         except Exception:
             guard.release()
