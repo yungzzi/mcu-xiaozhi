@@ -245,9 +245,9 @@ def test_history_sent_as_role_messages(server):
     assert events[-1]["type"] == "done"
     msgs = LAST_PAYLOAD["additional_messages"]
     assert msgs == [
-        {"role": "user", "content": "旧问", "content_type": "text"},
-        {"role": "assistant", "content": "旧答", "content_type": "text"},
-        {"role": "user", "content": "新问题", "content_type": "text"},
+        {"role": "user", "type": "question", "content": "旧问", "content_type": "text"},
+        {"role": "assistant", "type": "answer", "content": "旧答", "content_type": "text"},
+        {"role": "user", "type": "question", "content": "新问题", "content_type": "text"},
     ]
 
 

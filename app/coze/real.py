@@ -88,13 +88,18 @@ class RealCozeClient:
                 + [{"type": "image", "file_id": fid} for fid in req.file_ids],
                 ensure_ascii=False,
             )
-            message = {"role": "user", "content": content, "content_type": "object_string"}
+            message = {"role": "user", "type": "question", "content": content, "content_type": "object_string"}
         else:
-            message = {"role": "user", "content": req.text, "content_type": "text"}
+            message = {"role": "user", "type": "question", "content": req.text, "content_type": "text"}
         # 上下文重建：近期成功问答对按 role 放入 additional_messages，
         # 最后一条才是本次问题（审阅 P2，不拼成单条用户消息）
         messages = [
-            {"role": h["role"], "content": h["content"], "content_type": "text"}
+            {
+                "role": h["role"],
+                "type": "answer" if h["role"] == "assistant" else "question",
+                "content": h["content"],
+                "content_type": "text",
+            }
             for h in (req.history or [])
         ]
         messages.append(message)
