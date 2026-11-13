@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -17,6 +18,8 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from .auth import COOKIE_NAME
 from .coze import ChatRequest, CozeError
 from .db import now
+
+BASE_DIR = Path(__file__).resolve().parent
 
 
 def sse(event: str, data: dict) -> str:
@@ -89,7 +92,8 @@ def register_chat_routes(app):
         session = session_of(request)
         if session is None:
             return login_redirect()
-        return templates.TemplateResponse(request, "chat.html", {})
+        opening = json.loads((BASE_DIR / "opening.json").read_text(encoding="utf-8"))
+        return templates.TemplateResponse(request, "chat.html", {"opening": opening})
 
     @app.get("/history", name="history_page")
     def history_page(request: Request):
@@ -166,6 +170,47 @@ def register_chat_routes(app):
             lock.release()
         return {"ok": True}
 
+    @app.patch("/api/conversations/{cid}")
+    async def rename_conversation(request: Request, cid: int):
+        session = session_of(request)
+        if session is None:
+            return unauthorized()
+        conv = owned_conv(session, cid)
+        if conv is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "bad_json"}, status_code=400)
+        title = body.get("title") if isinstance(body, dict) else None
+        if not isinstance(title, str):
+            return JSONResponse({"error": "bad_title"}, status_code=400)
+        title = title.strip()
+        if not title or len(title) > 40:
+            return JSONResponse({"error": "bad_title", "message": "名称需为 1–40 个字符"}, status_code=400)
+        # 与发送/删除共用会话锁，避免生成中自动标题与重命名互相覆盖
+        lock = locks.setdefault(cid, asyncio.Lock())
+        if lock.locked():
+            return JSONResponse({"error": "busy", "message": "当前聊天正在生成回复，请稍候再重命名"}, status_code=409)
+        await lock.acquire()
+        try:
+            # 锁内重校验会话身份（复用发送接口的做法，审阅 P1）：
+            # 等待请求体期间旧聊天可能已被删除、整数 ID 被新聊天复用，
+            # 必须确认存在、归属一致、created_at 仍是原会话才能改名。
+            conv_now = owned_conv(session, cid)
+            if conv_now is None or conv_now["created_at"] != conv["created_at"]:
+                return JSONResponse({"error": "not_found"}, status_code=404)
+            cur = db.execute(
+                "UPDATE conversations SET title=?, auto_title=0"
+                " WHERE id=? AND token_hash=? AND created_at=?",
+                (title, cid, session["token_hash"], conv["created_at"]),
+            )
+            if cur.rowcount == 0:
+                return JSONResponse({"error": "not_found"}, status_code=404)
+        finally:
+            lock.release()
+        return {"id": cid, "title": title}
+
     @app.post("/api/conversations/{cid}/send")
     async def send_message(request: Request, cid: int):
         session = session_of(request)
@@ -241,8 +286,14 @@ def register_chat_routes(app):
             user_msg_id = user_cur.lastrowid
             for att_id in link_ids:
                 db.execute("UPDATE attachments SET message_id=? WHERE id=?", (user_msg_id, att_id))
-            if conv["title"] == "新对话" and text:
-                db.execute("UPDATE conversations SET title=? WHERE id=?", (text[:30], cid))
+            # 自动命名以 auto_title 标志为准（审阅 P2）：手动改过名（含改成
+            # 与默认相同的「新对话」）后不再被首问覆盖；自动命名一次后置 0。
+            if conv["auto_title"] and text:
+                db.execute(
+                    "UPDATE conversations SET title=?, auto_title=0"
+                    " WHERE id=? AND token_hash=? AND created_at=?",
+                    (text[:30], cid, session["token_hash"], conv["created_at"]),
+                )
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now(), cid))
         except Exception:
             guard.release()

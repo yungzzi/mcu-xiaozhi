@@ -3,17 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>{% block title %}MCU 小智{% endblock %}</title>
+  <meta name="theme-color" content="#8c1f28">
+  <title>{% block title %}MCU 小智 · 绍兴大学{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
 </head>
-<body>
-  <header class="topbar">
-    <span class="brand">MCU 小智</span>
-    {% block topbar_right %}{% endblock %}
-  </header>
-  <main class="container">
-    {% block content %}{% endblock %}
-  </main>
+<body class="{% block body_class %}{% endblock %}">
+  {% block content %}{% endblock %}
   {% block scripts %}{% endblock %}
 </body>
 </html>
