@@ -177,9 +177,9 @@ def test_rename_during_body_read_id_reuse(app):
         assert parse_sse(r.text)[-1][0] == "done"
 
 
-def test_migration_adds_auto_title(tmp_path):
-    """旧库（无 auto_title 列）启动时幂等补列，既有行默认允许自动命名。"""
-    path = tmp_path / "old.db"
+def _make_old_db(path, rows):
+    """构造 0.1.3 旧库（conversations 无 auto_title 列）。rows: (token_hash, title)。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.executescript("""
         CREATE TABLE conversations (
@@ -191,18 +191,60 @@ def test_migration_adds_auto_title(tmp_path):
             updated_at REAL NOT NULL
         );
     """)
-    conn.execute(
-        "INSERT INTO conversations(token_hash, title, created_at, updated_at) VALUES('h','旧聊天',1,1)")
+    for th, title in rows:
+        conn.execute(
+            "INSERT INTO conversations(token_hash, title, created_at, updated_at) VALUES(?,?,1,1)",
+            (th, title),
+        )
     conn.commit()
     conn.close()
+
+
+def test_migration_adds_auto_title(tmp_path):
+    """旧库启动幂等补列：已有非默认标题置 0，默认「新对话」保留 1。"""
+    path = tmp_path / "old.db"
+    _make_old_db(path, [("h", "晶振电路答疑"), ("h", "新对话")])
     db = Database(path)
     try:
         cols = {r[1] for r in db.query("PRAGMA table_info(conversations)")}
         assert "auto_title" in cols
-        row = db.query_one("SELECT title, auto_title FROM conversations WHERE id=1")
-        assert row["title"] == "旧聊天" and row["auto_title"] == 1
+        rows = {r["title"]: r["auto_title"] for r in db.query("SELECT title, auto_title FROM conversations")}
+        assert rows["晶振电路答疑"] == 0, "旧版已命名的聊天升级后不得再被自动命名"
+        assert rows["新对话"] == 1, "尚未命名的空聊天应保留自动命名资格"
     finally:
         db.close()
-    # 再次启动不重复加列（幂等）
+    # 再次启动不重复加列、不重置标志（幂等）
     db2 = Database(path)
-    db2.close()
+    try:
+        rows = {r["title"]: r["auto_title"] for r in db2.query("SELECT title, auto_title FROM conversations")}
+        assert rows == {"晶振电路答疑": 0, "新对话": 1}
+    finally:
+        db2.close()
+
+
+def test_old_db_titles_survive_followup(settings):
+    """审阅迁移 P2 回归：从 0.1.3 旧库启动，已有课程标题追问后保持原样；
+    旧库里尚未命名的空聊天仍能自动命名。"""
+    from app.main import create_app
+
+    _make_old_db(settings.db_path, [("placeholder", "晶振电路答疑"), ("placeholder", "新对话")])
+    app = create_app(settings)  # 迁移在此发生
+    with TestClient(app) as c:
+        login(c)
+        token_hash = app.state.db.query_one("SELECT token_hash FROM sessions")["token_hash"]
+        # 把旧数据挂到当前登录会话名下（迁移已按标题设好标志）
+        app.state.db.execute("UPDATE conversations SET token_hash=?", (token_hash,))
+        convs = {r["title"]: r["id"] for r in app.state.db.query("SELECT id, title FROM conversations")}
+        titled_id, empty_id = convs["晶振电路答疑"], convs["新对话"]
+
+        # 已有标题的聊天继续追问：标题不得被覆盖
+        r = c.post(f"/api/conversations/{titled_id}/send", json={"text": "负载电容怎么选？"})
+        assert parse_sse(r.text)[-1][0] == "done"
+        row = app.state.db.query_one("SELECT title FROM conversations WHERE id=?", (titled_id,))
+        assert row["title"] == "晶振电路答疑", "旧库已有标题被追问覆盖"
+
+        # 尚未命名的空聊天发首问：仍自动命名
+        r = c.post(f"/api/conversations/{empty_id}/send", json={"text": "复位电路的作用"})
+        assert parse_sse(r.text)[-1][0] == "done"
+        row = app.state.db.query_one("SELECT title FROM conversations WHERE id=?", (empty_id,))
+        assert row["title"] == "复位电路的作用", "旧库空聊天应仍能自动命名"

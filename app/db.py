@@ -76,6 +76,11 @@ class Database:
                 self._conn.execute(
                     "ALTER TABLE conversations ADD COLUMN auto_title INTEGER NOT NULL DEFAULT 1"
                 )
+                # 旧版已自动命名过的聊天（非默认标题）升级后不得再被追问覆盖：
+                # 只有仍是默认「新对话」的空聊天保留自动命名资格（审阅迁移 P2）
+                self._conn.execute(
+                    "UPDATE conversations SET auto_title=0 WHERE title != '新对话'"
+                )
             self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
